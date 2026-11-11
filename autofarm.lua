@@ -83,7 +83,7 @@ local CONFIG = {
         STONE = {"Stone", "StoneBlock", "StoneOre", "StoneRock", "StoneNode"},
         CLAY = {"Clay", "ClayBlock", "ClayOre", "ClayDeposit", "ClayNode"},
     },
-    SearchRange = 100,
+    SearchRange = 300,
     MaxVerticalDifference = 50,
     HoverHeight = 12,
     MinHoverHeight = 6,
