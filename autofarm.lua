@@ -38,7 +38,7 @@ local CONFIG = {
         SKELETONS = false,
         MORTON = false,
     },
-    SearchRange = 100,
+    SearchRange = 500,
     MaxVerticalDifference = 50,
     HoverHeight = 12,
     MinHoverHeight = 6,
