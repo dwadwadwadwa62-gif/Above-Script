@@ -2,7 +2,9 @@
     ABOVE | AUTO MOB FARM V11 - INDIVIDUAL TARGET TOGGLES
     - Slimes exclusive; Skeletons + Morton can be selected together
     - Three GUI pages: Farming, Combat and Mining
-    - Farming/Mining target selection UI only; gathering logic not connected
+    - Mining: six selectable resources with Wood/Stone/Iron+ pickaxe tier checks, overhead clicks, mob avoidance
+    - NOTE: Auto Mining requires the Roblox window to remain focused (does not work tabbed out).
+    - Farming selection UI only; harvesting logic not connected
     - Cleaner GUI inspired by user reference
     - B stops farming
     - Anti-AFK
@@ -40,18 +42,48 @@ local CONFIG = {
         SKELETONS = false,
         MORTON = false,
     },
-    -- Saved UI selections. Mining and harvesting automation are NOT wired yet.
+    -- Farming remains UI-only; mining uses exact Model-name mappings below.
     FarmingTargets = {
         BERRIES = false, ONIONS = false, CARROTS = false,
         WHEAT = false, OTHER_CROPS = false,
         FLOWERS = false, SHINIES = false,
     },
+    -- Mining position and safety are separate from Combat's hover settings.
+    MiningSearchRange = 300,       -- Ore detection only; Combat SearchRange remains 100
+    MiningHoverHeight = 5.5,        -- Root position above top of ore; lower if mining reach is too short
+    MiningClickDelay = 0.28,        -- Repeated clicks, NOT a continuous mouse hold
+    MiningThreatRadius = 18,       -- Avoid ore deposits with recognized mobs within this horizontal radius
+    MiningThreatVerticalRange = 18,
+    MiningThreatScanDelay = 0.75,  -- Cache hostile positions; don't scan workspace each Heartbeat
+    MiningEmergencyLift = 14,     -- Move upward when enemies come close while mining
+    MiningTargetTimeout = 10,
+    MiningRetryDelay = 6,
     MiningTargets = {
-        IRON = false, GOLD = false, COAL = false,
-        SAND = false, STONE = false, COPPER = false,
-        OTHER_ORES = false,
+        COAL = false, IRON = false, GOLD = false,
+        SAND = false, STONE = false, CLAY = false,
     },
-    SearchRange = 500,
+    -- 1=Wood, 2=Stone, 3=Iron or higher.
+    -- User-provided game progression rules; no ore above the current
+    -- pickaxe's requirement will be targeted.
+    MiningRequiredPickaxe = {
+        COAL = 1, IRON = 1, STONE = 1,
+        CLAY = 2, SAND = 2,
+        GOLD = 3,
+    },
+    MiningPickaxeScanDelay = 1.0,
+    -- Names below are exact after lowercasing and removing spaces, hyphens,
+    -- and underscores. IronOre is VERIFIED; other names are provisional.
+    -- If an ore isn't detected, inspect its real workspace Model name and
+    -- add that name to the appropriate group (not an inventory item name).
+    MiningOreNames = {
+        COAL = {"CoalOre", "CoalRock", "CoalNode", "CoalDeposit", "Coal"},
+        IRON = {"IronOre", "IronRock", "IronNode", "IronDeposit"},
+        GOLD = {"GoldOre", "GoldRock", "GoldNode", "GoldDeposit"},
+        SAND = {"Sand", "SandBlock", "SandOre", "SandDeposit", "SandNode"},
+        STONE = {"Stone", "StoneBlock", "StoneOre", "StoneRock", "StoneNode"},
+        CLAY = {"Clay", "ClayBlock", "ClayOre", "ClayDeposit", "ClayNode"},
+    },
+    SearchRange = 100,
     MaxVerticalDifference = 50,
     HoverHeight = 12,
     MinHoverHeight = 6,
@@ -74,6 +106,20 @@ local CONFIG = {
 }
 
 local enabled = false
+local miningEnabled = false
+local miningClickBusy = false
+local miningClickGeneration = 0
+local lastMiningClick = -math.huge
+local miningThreats = {}
+local lastMiningThreatScan = -math.huge
+local miningEvadePosition = nil
+local miningTarget = nil
+local miningTargetSince = 0
+local lastMiningScan = -math.huge
+local currentMiningPickaxeTier = 1  -- Conservative Wood-only fallback if unidentifiable.
+local currentMiningPickaxeName = "Unknown (Wood limit)"
+local lastMiningPickaxeScan = -math.huge
+local miningIgnoreUntil = setmetatable({}, { __mode = "k" })
 local alive = true
 local currentTarget = nil
 local lastAttack = 0
@@ -89,6 +135,7 @@ local windowFocused = true
 local lastAntiAfk = 0
 local oldCameraType
 local oldCameraSubject
+local restoreCamera -- forward declaration: Mining stop uses this function before its definition
 local hoverRoot
 local hoverForce
 local monitoredHumanoid
@@ -483,7 +530,10 @@ local function createResourcePage(pageName, heading, description, options, selec
     note.Position = UDim2.fromOffset(13, 54)
     note.BackgroundColor3 = Color3.fromRGB(29, 27, 47)
     note.BorderSizePixel = 0
-    note.Text = "SELECT TARGETS  •  AUTOMATION NOT CONNECTED YET"
+    note.Name = pageName .. "InfoBadge"
+    note.Text = pageName == "MINING"
+        and "6 RESOURCES  •  CLICK + OVERHEAD + MOB AVOIDANCE"
+        or "SELECT TARGETS  •  AUTOMATION NOT CONNECTED YET"
     note.Font = Enum.Font.GothamBold
     note.TextSize = 10
     note.TextColor3 = Color3.fromRGB(185, 172, 255)
@@ -541,7 +591,9 @@ local function createResourcePage(pageName, heading, description, options, selec
             if not alive then return end
             selections[key] = not selections[key]
             setSwitchVisual(button, knob, selections[key])
-            status.Text = pageName .. " filters saved (automation pending)"
+            status.Text = pageName == "MINING"
+                and (labelText .. (selections[key] and " selected" or " deselected"))
+                or "Farming selections saved (automation pending)"
         end)
     end
     return page
@@ -557,15 +609,46 @@ local farmingCard = createResourcePage("FARMING", "Auto Harvest", "Choose crops 
     {"SHINIES", "Shinies", "Collectible shiny items"},
 }, CONFIG.FarmingTargets)
 
-local miningCard = createResourcePage("MINING", "Auto Mining", "Choose which materials to target.", {
+local miningCard = createResourcePage("MINING", "Auto Mining", "Select any ores; click from above and avoid mobs.", {
+    {"COAL", "Coal", "Coal deposits"},
     {"IRON", "Iron", "Iron ore deposits"},
     {"GOLD", "Gold", "Gold ore deposits"},
-    {"COAL", "Coal", "Coal deposits"},
-    {"SAND", "Sand", "Sand resource blocks"},
-    {"STONE", "Stone", "Stone resource blocks"},
-    {"COPPER", "Copper", "If present in ABOVE"},
-    {"OTHER_ORES", "Other Ores", "More ore types (to be identified)"},
+    {"SAND", "Sand", "Mineable sand blocks"},
+    {"STONE", "Stone", "Mineable stone blocks"},
+    {"CLAY", "Clay", "Clay deposits"},
 }, CONFIG.MiningTargets)
+
+-- Add Mining Start/Stop inside the existing Mining tab; the Combat toggle stays separate.
+local miningScroll = miningCard:FindFirstChild("TargetsList")
+-- Make room for a visible, permanent Mining-only focus warning.
+miningScroll.Size = UDim2.new(1, -26, 0, 163)
+
+local miningFocusNote = Instance.new("TextLabel")
+miningFocusNote.Name = "MiningFocusWarning"
+miningFocusNote.Size = UDim2.new(1, -26, 0, 20)
+miningFocusNote.Position = UDim2.fromOffset(13, 253)
+miningFocusNote.BackgroundColor3 = Color3.fromRGB(48, 35, 29)
+miningFocusNote.BorderSizePixel = 0
+miningFocusNote.Text = "NOTE: Auto Mining will NOT work while tabbed out!"
+miningFocusNote.TextColor3 = Color3.fromRGB(255, 194, 123)
+miningFocusNote.Font = Enum.Font.GothamBold
+miningFocusNote.TextSize = 11
+miningFocusNote.TextXAlignment = Enum.TextXAlignment.Center
+miningFocusNote.Parent = miningCard
+corner(miningFocusNote, 6)
+
+local miningButton = Instance.new("TextButton")
+miningButton.Name = "AutoMiningToggle"
+miningButton.Size = UDim2.new(1, -26, 0, 33)
+miningButton.Position = UDim2.fromOffset(13, 281)
+miningButton.BackgroundColor3 = Color3.fromRGB(87, 63, 157)
+miningButton.BorderSizePixel = 0
+miningButton.Text = "START AUTO MINING"
+miningButton.TextColor3 = Color3.fromRGB(246, 244, 253)
+miningButton.Font = Enum.Font.GothamBold
+miningButton.TextSize = 11
+miningButton.Parent = miningCard
+corner(miningButton, 8)
 
 local pageCards = {FARMING = farmingCard, COMBAT = card, MINING = miningCard}
 local currentPage = "COMBAT"
@@ -1064,11 +1147,442 @@ local function attack()
 end
 
 -- ==========================================
+-- Mining: individually selectable ores, clicking overhead with mob avoidance
+-- ==========================================
+-- IronOre was observed in workspace; aliases for other resource types are
+-- provisional and must be checked against ABOVE's real Model names.
+-- This scans client-visible Models; Terrain voxels aren't supported.
+-- The server ultimately decides whether clicks produce mining progress.
+
+local function stopMiningClicks()
+    -- Cancels any queued next click; each already-started click releases itself.
+    miningClickGeneration = miningClickGeneration + 1
+end
+
+local function mineClick(expectedTarget)
+    if miningClickBusy or not miningEnabled or not windowFocused then return end
+    if os.clock() - lastMiningClick < CONFIG.MiningClickDelay then return end
+    miningClickBusy = true
+    lastMiningClick = os.clock()
+    local generation = miningClickGeneration
+
+    task.spawn(function()
+        if not alive or not miningEnabled or generation ~= miningClickGeneration
+            or expectedTarget ~= miningTarget or not windowFocused then
+            miningClickBusy = false
+            return
+        end
+
+        local view = camera.ViewportSize
+        local x, y = math.floor(view.X / 2), math.floor(view.Y / 2)
+        if type(mousemoveabs) == "function" then pcall(mousemoveabs, x, y) end
+
+        local clicked = false
+        if type(mouse1click) == "function" then
+            clicked = pcall(mouse1click)
+        end
+        if not clicked then
+            clicked = virtualClick(x, y)
+        end
+        if not clicked then
+            -- Only as a fallback for games exposing their pickaxe as a Roblox Tool.
+            local char = player.Character
+            local tool = char and char:FindFirstChildOfClass("Tool")
+            if tool and string.find(string.lower(tool.Name), "pickaxe", 1, true) then
+                pcall(function() tool:Activate() end)
+            end
+        end
+        miningClickBusy = false
+    end)
+end
+
+local function setMiningEnabled(value)
+    if not alive then return end
+    if value == miningEnabled then return end
+    miningEnabled = value
+    miningTarget = nil
+    miningTargetSince = 0
+    lastMiningScan = -math.huge
+    lastMiningThreatScan = -math.huge
+    miningEvadePosition = nil
+    lastMiningPickaxeScan = -math.huge
+    stopMiningClicks()
+    if miningEnabled then
+        oldCameraType = camera.CameraType
+        oldCameraSubject = camera.CameraSubject
+        miningButton.Text = "STOP AUTO MINING"
+        miningButton.BackgroundColor3 = Color3.fromRGB(145, 55, 84)
+        status.Text = "Mining: scanning selected ores (click + hover)"
+    else
+        miningButton.Text = "START AUTO MINING"
+        miningButton.BackgroundColor3 = Color3.fromRGB(87, 63, 157)
+        releaseHover()
+        restoreCamera()
+        status.Text = "Mining stopped"
+    end
+end
+
+local oreTypeByName = {}
+local function normalizeOreName(name)
+    return string.lower(tostring(name or "")):gsub("[%s_%-]", "")
+end
+for oreType, aliases in pairs(CONFIG.MiningOreNames) do
+    for _, alias in ipairs(aliases) do
+        oreTypeByName[normalizeOreName(alias)] = oreType
+    end
+end
+
+local function oreTypeOf(model)
+    if not model or not model:IsA("Model") then return nil end
+    return oreTypeByName[normalizeOreName(model.Name)]
+end
+
+-- Respect actual mining tiers, not just which ore checkboxes are ticked.
+-- ABOVE uses a custom equipment UI. Prefer an equipped Roblox Tool if present;
+-- otherwise read the "PICKAXE" equipment slot in AboveBackpack (even when hidden).
+-- Backpack item-card names alone are NOT evidence that a pickaxe is equipped.
+local higherPickaxes = {
+    gold = true, golden = true, diamond = true, steel = true,
+    titanium = true, platinum = true, obsidian = true, netherite = true,
+    mythril = true, mithril = true, adamantite = true, crystal = true,
+    emerald = true, cobalt = true,
+}
+local function classifyPickaxe(name)
+    local cleaned = normalizeOreName(name)
+    if not cleaned:find("pickaxe", 1, true) then return nil end
+    if cleaned:find("wood", 1, true) then return 1, "Wood" end
+    if cleaned:find("stone", 1, true) then return 2, "Stone" end
+    if cleaned:find("iron", 1, true) then return 3, "Iron+" end
+    for material in pairs(higherPickaxes) do
+        if cleaned:find(material, 1, true) then return 3, "Iron+" end
+    end
+    return nil -- Don't presume an unknown material is stronger than iron.
+end
+
+local function getGuiText(obj)
+    if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
+        return tostring(obj.Text or "")
+    end
+    return ""
+end
+
+local function detectEquippedCustomPickaxe()
+    local backpackGui = playerGui:FindFirstChild("AboveBackpack")
+    if not backpackGui then return nil end
+    for _, obj in ipairs(backpackGui:GetDescendants()) do
+        if string.upper(getGuiText(obj):match("^%s*(.-)%s*$")) == "PICKAXE" then
+            local ancestor = obj.Parent
+            for _ = 1, 3 do
+                if not ancestor or ancestor == backpackGui then break end
+                for _, child in ipairs(ancestor:GetDescendants()) do
+                    if child ~= obj then
+                        local rank, label = classifyPickaxe(getGuiText(child))
+                        if rank then return rank, label end
+                    end
+                end
+                ancestor = ancestor.Parent
+            end
+        end
+    end
+    return nil
+end
+
+local function detectCurrentPickaxe()
+    local char = player.Character
+    local equippedTool = char and char:FindFirstChildOfClass("Tool")
+    if equippedTool then
+        local rank, name = classifyPickaxe(equippedTool.Name)
+        if rank then return rank, name end
+    end
+    local guiRank, guiName = detectEquippedCustomPickaxe()
+    if guiRank then return guiRank, guiName end
+    -- Some games expose normal pickaxes in Backpack, but ABOVE usually does not.
+    -- Inspect them only as a fallback; actual mining still uses normal click input.
+    local backpack = player:FindFirstChildOfClass("Backpack")
+    if backpack then
+        local highest, name = nil, nil
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") then
+                local rank, label = classifyPickaxe(tool.Name)
+                if rank and (not highest or rank > highest) then
+                    highest, name = rank, label
+                end
+            end
+        end
+        if highest then return highest, name end
+    end
+    return 1, "Unknown (Wood limit)" -- No guessed unlocks for Clay/Sand/Gold.
+end
+
+local function refreshMiningPickaxe(now)
+    if now - lastMiningPickaxeScan < CONFIG.MiningPickaxeScanDelay then return end
+    lastMiningPickaxeScan = now
+    currentMiningPickaxeTier, currentMiningPickaxeName = detectCurrentPickaxe()
+    local badge = miningCard:FindFirstChild("MININGInfoBadge")
+    if badge then
+        if currentMiningPickaxeTier == 1 then
+            badge.Text = "PICKAXE: " .. currentMiningPickaxeName .. "  •  COAL / IRON / STONE"
+        elseif currentMiningPickaxeTier == 2 then
+            badge.Text = "PICKAXE: STONE  •  ALL EXCEPT GOLD"
+        else
+            badge.Text = "PICKAXE: IRON+  •  ALL 6 RESOURCES AVAILABLE"
+        end
+    end
+end
+
+local function pickaxeCanMine(oreType)
+    local required = CONFIG.MiningRequiredPickaxe[oreType]
+    return required ~= nil and currentMiningPickaxeTier >= required
+end
+
+local function hasEligibleMiningOre()
+    for oreType, selected in pairs(CONFIG.MiningTargets) do
+        if selected and pickaxeCanMine(oreType) then return true end
+    end
+    return false
+end
+
+local function hasSelectedMiningOre()
+    for _, selected in pairs(CONFIG.MiningTargets) do
+        if selected then return true end
+    end
+    return false
+end
+
+local function getOrePart(model)
+    if not model or not model:IsA("Model") then return nil end
+    -- Keep the exact working IronOre mesh selection for iron.
+    if oreTypeOf(model) == "IRON" then
+        local inspectedPart = model:FindFirstChild("Icosphere.004", true)
+        if inspectedPart and inspectedPart:IsA("BasePart") then
+            return inspectedPart
+        end
+    end
+    return getTargetRoot(model)
+end
+
+local function oreTopPosition(model, part)
+    -- Use the actual upper surface of the whole ore model where possible.
+    local top = part.Position.Y + part.Size.Y * 0.5
+    local ok, cf, size = pcall(function() return model:GetBoundingBox() end)
+    if ok and cf and size then
+        top = math.max(top, cf.Position.Y + size.Y * 0.5)
+    end
+    return Vector3.new(part.Position.X, top, part.Position.Z)
+end
+
+local function refreshMiningThreats(now)
+    if now - lastMiningThreatScan < CONFIG.MiningThreatScanDelay then return end
+    lastMiningThreatScan = now
+    local threats = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        -- These are the same recognized mob kinds as Combat, but independent
+        -- of the Combat tab's selected target switches.
+        local kind = getTargetKind(obj)
+        if kind and obj:IsDescendantOf(workspace) and not isPlayerPart(obj) then
+            local mobPart = getTargetRoot(obj)
+            local hp = getHealth(obj)
+            if mobPart and mobPart:IsDescendantOf(workspace)
+                and (hp == nil or hp > 0) then
+                table.insert(threats, mobPart.Position)
+            end
+        end
+    end
+    miningThreats = threats
+end
+
+local function nearMiningThreat(position)
+    for _, threatPos in ipairs(miningThreats) do
+        local delta = position - threatPos
+        local horizontal = Vector2.new(delta.X, delta.Z).Magnitude
+        if horizontal <= CONFIG.MiningThreatRadius
+            and math.abs(delta.Y) <= CONFIG.MiningThreatVerticalRange then
+            return true
+        end
+    end
+    return false
+end
+
+local function findNearestSafeOre(root)
+    local candidate, bestDistance = nil, CONFIG.MiningSearchRange
+    local now = os.clock()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and (miningIgnoreUntil[obj] or 0) <= now then
+            local oreType = oreTypeOf(obj)
+            if oreType and CONFIG.MiningTargets[oreType] and pickaxeCanMine(oreType) then
+                local orePart = getOrePart(obj)
+                if orePart and orePart:IsDescendantOf(workspace)
+                    and not isPlayerPart(orePart) then
+                    local oreTop = oreTopPosition(obj, orePart)
+                    local minePos = oreTop + Vector3.new(0, CONFIG.MiningHoverHeight, 0)
+                    local distance = (orePart.Position - root.Position).Magnitude
+                    local vertical = math.abs(orePart.Position.Y - root.Position.Y)
+                    if distance < bestDistance and vertical <= CONFIG.MaxVerticalDifference
+                        and not nearMiningThreat(minePos) then
+                        candidate = obj
+                        bestDistance = distance
+                    end
+                end
+            end
+        end
+    end
+    return candidate
+end
+
+local function evadeMiningMobs(root)
+    stopMiningClicks()
+    if not miningEvadePosition then
+        miningEvadePosition = root.Position + Vector3.new(0, CONFIG.MiningEmergencyLift, 0)
+    end
+    local hold = ensureHover(root)
+    if hold then
+        pcall(function()
+            hold.Position = miningEvadePosition
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = CFrame.new(miningEvadePosition)
+        end)
+    end
+    status.Text = "Mining: avoiding nearby mob (no clicks)"
+end
+
+local function updateMining(root)
+    local now = os.clock()
+    refreshMiningPickaxe(now)
+    if not hasSelectedMiningOre() then
+        setMiningEnabled(false)
+        status.Text = "Mining stopped: select at least one ore"
+        return
+    end
+    if not hasEligibleMiningOre() then
+        stopMiningClicks()
+        miningTarget = nil
+        miningTargetSince = 0
+        status.Text = "Mining: selected ores require a stronger pickaxe"
+        return
+    end
+
+    refreshMiningThreats(now)
+    local targetOreType = miningTarget and oreTypeOf(miningTarget)
+    local part = miningTarget and miningTarget:IsDescendantOf(workspace)
+        and targetOreType and CONFIG.MiningTargets[targetOreType]
+        and pickaxeCanMine(targetOreType)
+        and getOrePart(miningTarget)
+    if not part or not part:IsDescendantOf(workspace) then
+        if miningTarget then stopMiningClicks() end
+        miningTarget = nil
+        miningTargetSince = 0
+    elseif nearMiningThreat(oreTopPosition(miningTarget, part)
+        + Vector3.new(0, CONFIG.MiningHoverHeight, 0)) then
+        -- Never mine through a nearby hostile mob: skip and seek a safer node.
+        stopMiningClicks()
+        miningIgnoreUntil[miningTarget] = now + CONFIG.MiningRetryDelay
+        miningTarget = nil
+        miningTargetSince = 0
+    elseif now - miningTargetSince >= CONFIG.MiningTargetTimeout then
+        stopMiningClicks()
+        miningIgnoreUntil[miningTarget] = now + CONFIG.MiningRetryDelay
+        miningTarget = nil
+        miningTargetSince = 0
+        status.Text = "Mining: skipping stalled " .. (targetOreType or "ore")
+    end
+
+    if not miningTarget and now - lastMiningScan >= CONFIG.ScanDelay then
+        lastMiningScan = now
+        miningTarget = findNearestSafeOre(root)
+        miningTargetSince = miningTarget and now or 0
+    end
+
+    if not miningTarget then
+        stopMiningClicks()
+        if nearMiningThreat(root.Position) then
+            evadeMiningMobs(root)
+        else
+            miningEvadePosition = nil
+            status.Text = "Mining: no safe selected ores within " .. CONFIG.MiningSearchRange .. " studs"
+        end
+        return
+    end
+    miningEvadePosition = nil
+
+    local orePart = getOrePart(miningTarget)
+    if not orePart then
+        stopMiningClicks()
+        miningTarget = nil
+        return
+    end
+
+    local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then
+        stopMiningClicks()
+        return
+    end
+
+    -- If ABOVE exposes a standard Tool, equip the best tier we can identify.
+    -- For its custom equipment system, keep the user's current pickaxe equipped.
+    local heldTool = player.Character:FindFirstChildOfClass("Tool")
+    local heldRank = heldTool and select(1, classifyPickaxe(heldTool.Name)) or 0
+    local backpack = player:FindFirstChildOfClass("Backpack")
+    if backpack then
+        local bestTool, bestTier = nil, heldRank
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") then
+                local rank = select(1, classifyPickaxe(tool.Name))
+                if rank and rank > bestTier then
+                    bestTool, bestTier = tool, rank
+                end
+            end
+        end
+        if bestTool then pcall(function() humanoid:EquipTool(bestTool) end) end
+    end
+
+    local orePos = orePart.Position
+    local oreTop = oreTopPosition(miningTarget, orePart)
+    local desired = oreTop + Vector3.new(0, CONFIG.MiningHoverHeight, 0)
+
+    if nearMiningThreat(desired) then
+        evadeMiningMobs(root)
+        return
+    end
+
+    -- Stand above the rock instead of beside it, independently of Combat height.
+    local hold = ensureHover(root)
+    if not hold then
+        stopMiningClicks()
+        status.Text = "Mining: cannot maintain hover"
+        return
+    end
+    pcall(function()
+        hold.Position = desired
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.CFrame = CFrame.lookAt(desired, orePos)
+    end)
+
+    camera.CameraType = Enum.CameraType.Scriptable
+    camera.CFrame = CFrame.lookAt(desired + Vector3.new(0, 2, 3), orePos)
+
+    if (root.Position - desired).Magnitude > 7 then
+        stopMiningClicks()
+        status.Text = "Mining: moving above " .. tostring(oreTypeOf(miningTarget) or "ore")
+        return
+    end
+    if not windowFocused then
+        stopMiningClicks()
+        status.Text = "Mining paused: focus ABOVE window"
+        return
+    end
+
+    mineClick(miningTarget)
+    status.Text = "Mining: clicking " .. tostring(oreTypeOf(miningTarget) or "ore") .. " from above"
+end
+
+-- ==========================================
 -- Anti-idle
 -- ==========================================
 
 idleConnection = player.Idled:Connect(function()
-    if not alive or not enabled or not CONFIG.AntiAFK then return end
+    if not alive or not (enabled or miningEnabled) or not CONFIG.AntiAFK then return end
     if os.clock() - lastAntiAfk < 10 then return end
     lastAntiAfk = os.clock()
 
@@ -1091,7 +1605,7 @@ end)
 -- State / reset / cleanup
 -- ==========================================
 
-local function restoreCamera()
+restoreCamera = function()
     if oldCameraType then
         camera.CameraType = oldCameraType
         if oldCameraSubject and oldCameraSubject.Parent then
@@ -1108,6 +1622,7 @@ end
 
 local function setEnabled(value)
     if not alive then return end
+    if value and miningEnabled then setMiningEnabled(false) end
     if resetInProgress then
         -- Pressing B / Stop during a respawn cancels automatic resuming.
         if not value then
@@ -1203,6 +1718,21 @@ local function resetCharacter(reason)
     end)
 end
 
+-- Mining start is independent of Combat's original Auto Combat switch.
+miningButton.MouseButton1Click:Connect(function()
+    if not alive then return end
+    if not miningEnabled then
+        if not hasSelectedMiningOre() then
+            status.Text = "Select at least one mining resource first"
+            return
+        end
+        if enabled then setEnabled(false) end
+        setMiningEnabled(true)
+    else
+        setMiningEnabled(false)
+    end
+end)
+
 local lastToggle = 0
 toggle.MouseButton1Click:Connect(function()
     if os.clock() - lastToggle < 0.5 then return end
@@ -1211,6 +1741,7 @@ toggle.MouseButton1Click:Connect(function()
 end)
 
 stopButton.MouseButton1Click:Connect(function()
+    setMiningEnabled(false)
     setEnabled(false)
     status.Text = "Stopped"
 end)
@@ -1240,6 +1771,7 @@ end)
 keyConnection = UIS.InputBegan:Connect(function(input, processed)
     if processed or not alive or UIS:GetFocusedTextBox() then return end
     if input.KeyCode == Enum.KeyCode.B then
+        setMiningEnabled(false)
         setEnabled(false)
         status.Text = "Stopped with B"
     end
@@ -1247,6 +1779,7 @@ end)
 
 local function stop()
     if not alive then return end
+    setMiningEnabled(false)
     setEnabled(false)
     alive = false
     if farmConnection then farmConnection:Disconnect() end
@@ -1269,7 +1802,19 @@ close.MouseButton1Click:Connect(stop)
 -- ==========================================
 
 farmConnection = RunService.Heartbeat:Connect(function()
-    if not alive or not enabled or resetInProgress then return end
+    if not alive or resetInProgress then return end
+    if miningEnabled then
+        local _, root = getCharacter()
+        if root then
+            updateMining(root)
+        else
+            stopMiningClicks()
+            releaseHover()
+            status.Text = "Mining: waiting for character"
+        end
+        return
+    end
+    if not enabled then return end
 
     local _, root, hum = getCharacter()
     if not root then
@@ -1423,4 +1968,4 @@ farmConnection = RunService.Heartbeat:Connect(function()
     end
 end)
 
-print("[ABOVE] V11 ready: individual Slimes / Skeletons / Morton toggles; Skeletons + Morton allowed")
+print("[ABOVE] V17 ready: 6 ores, automatic pickaxe tier limits, overhead click mining, mob avoidance")
