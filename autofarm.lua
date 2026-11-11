@@ -1,6 +1,6 @@
 --[[
-    ABOVE | AUTO MOB FARM V9
-    - Slimes + Skeletons
+    ABOVE | AUTO MOB FARM V11 - INDIVIDUAL TARGET TOGGLES
+    - Slimes exclusive; Skeletons + Morton can be selected together
     - Cleaner GUI inspired by user reference
     - B stops farming
     - Anti-AFK
@@ -31,15 +31,21 @@ local CONFIG = {
         orangeslime = true,
     },
     SkeletonKeyword = "skeleton",
-    TargetMode = "ALL", -- ALL, SLIMES, SKELETONS
-    SearchRange = 500,
+    BossKeyword = "morton", -- Matches Parts/Models containing Morton (case-insensitive)
+    -- Separate target switches. Slimes run alone; Skeletons + Morton can run together.
+    EnabledTargets = {
+        SLIMES = true,
+        SKELETONS = false,
+        MORTON = false,
+    },
+    SearchRange = 100,
     MaxVerticalDifference = 50,
     HoverHeight = 12,
     MinHoverHeight = 6,
     MaxHoverHeight = 24,
-    HeightStep = 1,
-    AutoRaiseOnDamage = false,
-    AutoRaiseStep = 0,
+    HeightStep = 2,
+    AutoRaiseOnDamage = true,
+    AutoRaiseStep = 2,
     AutoRaiseCooldown = 2,
     AttackDelay = 0.35,
     ScanDelay = 0.6,
@@ -120,7 +126,7 @@ end
 
 local main = Instance.new("Frame")
 main.Name = "MainFrame"
-main.Size = UDim2.fromOffset(560, 345)
+main.Size = UDim2.fromOffset(560, 458)
 main.Position = UDim2.fromOffset(18, 60)
 main.BackgroundColor3 = Color3.fromRGB(9, 12, 22)
 main.BorderSizePixel = 0
@@ -132,7 +138,7 @@ stroke(main, Color3.fromRGB(45, 52, 76), 1, 0.25)
 
 local sidebar = Instance.new("Frame")
 sidebar.Name = "Sidebar"
-sidebar.Size = UDim2.fromOffset(120, 345)
+sidebar.Size = UDim2.fromOffset(120, 458)
 sidebar.Position = UDim2.fromOffset(0, 0)
 sidebar.BackgroundColor3 = Color3.fromRGB(6, 9, 19)
 sidebar.BorderSizePixel = 0
@@ -140,7 +146,7 @@ sidebar.Parent = main
 corner(sidebar, 14)
 
 local sidebarMask = Instance.new("Frame")
-sidebarMask.Size = UDim2.fromOffset(22, 345)
+sidebarMask.Size = UDim2.fromOffset(22, 458)
 sidebarMask.Position = UDim2.new(1, -22, 0, 0)
 sidebarMask.BackgroundColor3 = main.BackgroundColor3
 sidebarMask.BorderSizePixel = 0
@@ -190,7 +196,7 @@ navLabel("Settings", 185, false)
 
 local content = Instance.new("Frame")
 content.Name = "Content"
-content.Size = UDim2.fromOffset(420, 345)
+content.Size = UDim2.fromOffset(420, 458)
 content.Position = UDim2.fromOffset(120, 0)
 content.BackgroundTransparency = 1
 content.Parent = main
@@ -209,7 +215,7 @@ searchBox.Position = UDim2.fromOffset(138, 4)
 searchBox.BackgroundColor3 = Color3.fromRGB(15, 18, 32)
 searchBox.BorderSizePixel = 0
 searchBox.ClearTextOnFocus = false
-searchBox.PlaceholderText = "Search..."
+searchBox.PlaceholderText = "Find target..."
 searchBox.Text = ""
 searchBox.TextColor3 = Color3.fromRGB(225,225,230)
 searchBox.PlaceholderColor3 = Color3.fromRGB(110, 116, 145)
@@ -242,7 +248,7 @@ close.Name = "CloseButton"
 
 local card = Instance.new("Frame")
 card.Name = "FarmCard"
-card.Size = UDim2.new(1, -18, 0, 220)
+card.Size = UDim2.new(1, -18, 0, 325)
 card.Position = UDim2.fromOffset(10, 58)
 card.BackgroundColor3 = Color3.fromRGB(14, 17, 30)
 card.BorderSizePixel = 0
@@ -269,7 +275,7 @@ cardSub.TextXAlignment = Enum.TextXAlignment.Left
 cardSub.Font = Enum.Font.Gotham
 cardSub.TextSize = 11
 cardSub.TextColor3 = Color3.fromRGB(136, 140, 164)
-cardSub.Text = "Clean mode for slimes and skeletons."
+cardSub.Text = "Select which enemies to farm."
 cardSub.Parent = card
 
 local function makeSwitch(parent, x, y, initial)
@@ -330,30 +336,27 @@ local function row(y, labelText, subText)
     return holder, label, sub
 end
 
-local farmHolder, farmLabel, farmSub = row(56, "Auto Farm", "Start or pause the current farm.")
-local targetHolder, targetLabel, targetSub = row(97, "Target Mode", "Switch between slimes, skeletons, or all.")
-local heightHolder, heightLabel, heightSub = row(138, "Hover Height", "Adjust floating clearance.")
-local resetHolder, resetLabel, resetSub = row(179, "10s Stall Reset", "Resets when no damage/kill is detected.")
+-- Dedicated switches, matching the requested three-row target layout.
+local farmHolder, farmLabel, farmSub = row(58, "Auto Farm", "Start or pause farming.")
+local slimeHolder, slimeLabel, slimeSub = row(102, "Slimes", "Blue, Green, Pink and Orange")
+local skeletonHolder, skeletonLabel, skeletonSub = row(145, "Skeletons", "Can run alongside Morton")
+local mortonHolder, mortonLabel, mortonSub = row(188, "Morton", "Can run alongside Skeletons")
+local heightHolder, heightLabel, heightSub = row(231, "Hover Height", "Adjust floating clearance.")
+local resetHolder, resetLabel, resetSub = row(274, "10s Stall Reset", "Resets if no damage/kill is detected.")
 
 local toggle, toggleKnob = makeSwitch(card, 333, 62, false)
 toggle.Name = "FarmToggle"
-local modeButton = Instance.new("TextButton")
-modeButton.Name = "TargetMode"
-modeButton.Size = UDim2.fromOffset(108, 28)
-modeButton.Position = UDim2.fromOffset(280, 103)
-modeButton.BackgroundColor3 = Color3.fromRGB(72, 75, 96)
-modeButton.BorderSizePixel = 0
-modeButton.Text = "ALL"
-modeButton.TextColor3 = Color3.fromRGB(245,245,250)
-modeButton.Font = Enum.Font.GothamBold
-modeButton.TextSize = 12
-modeButton.Parent = card
-corner(modeButton, 10)
+local slimeToggle, slimeKnob = makeSwitch(card, 333, 106, CONFIG.EnabledTargets.SLIMES)
+slimeToggle.Name = "SlimesToggle"
+local skeletonToggle, skeletonKnob = makeSwitch(card, 333, 149, CONFIG.EnabledTargets.SKELETONS)
+skeletonToggle.Name = "SkeletonsToggle"
+local mortonToggle, mortonKnob = makeSwitch(card, 333, 192, CONFIG.EnabledTargets.MORTON)
+mortonToggle.Name = "MortonToggle"
 
 local minus = Instance.new("TextButton")
 minus.Name = "HeightMinus"
 minus.Size = UDim2.fromOffset(28, 28)
-minus.Position = UDim2.fromOffset(284, 144)
+minus.Position = UDim2.fromOffset(284, 237)
 minus.BackgroundColor3 = Color3.fromRGB(72, 75, 96)
 minus.BorderSizePixel = 0
 minus.Text = "-"
@@ -366,7 +369,7 @@ corner(minus, 9)
 local heightValue = Instance.new("TextLabel")
 heightValue.BackgroundColor3 = Color3.fromRGB(20, 23, 38)
 heightValue.BorderSizePixel = 0
-heightValue.Position = UDim2.fromOffset(319, 144)
+heightValue.Position = UDim2.fromOffset(319, 237)
 heightValue.Size = UDim2.fromOffset(48, 28)
 heightValue.Font = Enum.Font.GothamBold
 heightValue.TextSize = 12
@@ -379,7 +382,7 @@ stroke(heightValue, Color3.fromRGB(45, 50, 74), 1, 0.35)
 local plus = Instance.new("TextButton")
 plus.Name = "HeightPlus"
 plus.Size = UDim2.fromOffset(28, 28)
-plus.Position = UDim2.fromOffset(372, 144)
+plus.Position = UDim2.fromOffset(372, 237)
 plus.BackgroundColor3 = Color3.fromRGB(72, 75, 96)
 plus.BorderSizePixel = 0
 plus.Text = "+"
@@ -393,7 +396,7 @@ local resetBadge = Instance.new("TextLabel")
 resetBadge.Name = "StallResetStatus"
 resetBadge.BackgroundColor3 = Color3.fromRGB(121, 87, 255)
 resetBadge.BorderSizePixel = 0
-resetBadge.Position = UDim2.fromOffset(281, 185)
+resetBadge.Position = UDim2.fromOffset(281, 280)
 resetBadge.Size = UDim2.fromOffset(105, 26)
 resetBadge.Font = Enum.Font.GothamBold
 resetBadge.TextSize = 11
@@ -404,7 +407,7 @@ corner(resetBadge, 10)
 
 local statusPanel = Instance.new("Frame")
 statusPanel.Size = UDim2.new(1, -18, 0, 54)
-statusPanel.Position = UDim2.fromOffset(10, 280)
+statusPanel.Position = UDim2.fromOffset(10, 392)
 statusPanel.BackgroundColor3 = Color3.fromRGB(11, 14, 25)
 statusPanel.BorderSizePixel = 0
 statusPanel.Parent = content
@@ -449,7 +452,7 @@ stroke(stopButton, Color3.fromRGB(45, 50, 74), 1, 0.35)
 
 local antiAfkText = Instance.new("TextLabel")
 antiAfkText.BackgroundTransparency = 1
-antiAfkText.Position = UDim2.fromOffset(12, 312)
+antiAfkText.Position = UDim2.fromOffset(12, 427)
 antiAfkText.Size = UDim2.fromOffset(106, 18)
 antiAfkText.TextXAlignment = Enum.TextXAlignment.Left
 antiAfkText.Font = Enum.Font.Gotham
@@ -538,50 +541,82 @@ end
 plus.MouseButton1Click:Connect(function() changeHeight(CONFIG.HeightStep) end)
 minus.MouseButton1Click:Connect(function() changeHeight(-CONFIG.HeightStep) end)
 
-local function cycleMode()
-    if CONFIG.TargetMode == "ALL" then
-        CONFIG.TargetMode = "SKELETONS"
-    elseif CONFIG.TargetMode == "SKELETONS" then
-        CONFIG.TargetMode = "SLIMES"
+-- ==========================================
+-- Individual target toggles: Slimes are exclusive; Skeletons + Morton combine.
+-- ==========================================
+local function selectedTargetNames()
+    local selected = CONFIG.EnabledTargets
+    if selected.SLIMES then return "SLIMES" end
+    if selected.SKELETONS and selected.MORTON then return "SKELETONS + MORTON" end
+    if selected.SKELETONS then return "SKELETONS" end
+    if selected.MORTON then return "MORTON" end
+    return "NONE"
+end
+
+local function refreshTargetSwitches()
+    setSwitchVisual(slimeToggle, slimeKnob, CONFIG.EnabledTargets.SLIMES)
+    setSwitchVisual(skeletonToggle, skeletonKnob, CONFIG.EnabledTargets.SKELETONS)
+    setSwitchVisual(mortonToggle, mortonKnob, CONFIG.EnabledTargets.MORTON)
+    cardSub.Text = "Selected: " .. selectedTargetNames()
+end
+
+local function setTargetEnabled(kind, desired)
+    if not alive then return end
+    local targets = CONFIG.EnabledTargets
+
+    if desired then
+        if kind == "SLIMES" then
+            targets.SLIMES = true
+            targets.SKELETONS = false
+            targets.MORTON = false
+        elseif kind == "SKELETONS" or kind == "MORTON" then
+            targets.SLIMES = false
+            targets[kind] = true
+        end
     else
-        CONFIG.TargetMode = "ALL"
+        targets[kind] = false
     end
-    modeButton.Text = CONFIG.TargetMode
-    targetSub.Text = "Switch between slimes, skeletons, or all. Current: " .. CONFIG.TargetMode
+
+    refreshTargetSwitches()
     currentTarget = nil
     targetSince = 0
     combatStartedAt = 0
+    lastObservedProgress = 0
     lastScan = 0
-    status.Text = "Mode: " .. CONFIG.TargetMode
+    status.Text = "Targets: " .. selectedTargetNames()
 end
 
-modeButton.MouseButton1Click:Connect(cycleMode)
+slimeToggle.MouseButton1Click:Connect(function()
+    setTargetEnabled("SLIMES", not CONFIG.EnabledTargets.SLIMES)
+end)
 
--- The search field sets the target mode for common queries.
+skeletonToggle.MouseButton1Click:Connect(function()
+    setTargetEnabled("SKELETONS", not CONFIG.EnabledTargets.SKELETONS)
+end)
+
+mortonToggle.MouseButton1Click:Connect(function()
+    setTargetEnabled("MORTON", not CONFIG.EnabledTargets.MORTON)
+end)
+
+-- Optional search shortcut, applying the same exclusivity rules.
 searchBox.FocusLost:Connect(function()
     local term = string.lower((searchBox.Text or ""):gsub("%s+", ""))
-    local chosen = nil
     if term == "slime" or term == "slimes" then
-        chosen = "SLIMES"
+        setTargetEnabled("SLIMES", true)
     elseif term == "skeleton" or term == "skeletons" then
-        chosen = "SKELETONS"
-    elseif term == "all" or term == "both" then
-        chosen = "ALL"
-    end
-    if chosen then
-        CONFIG.TargetMode = chosen
-        modeButton.Text = chosen
-        targetSub.Text = "Target mode: " .. chosen
-        currentTarget = nil
-        targetSince = 0
-        combatStartedAt = 0
-        lastScan = 0
-        status.Text = "Mode: " .. chosen
+        setTargetEnabled("SKELETONS", true)
+    elseif term == "morton" or term == "boss" then
+        setTargetEnabled("MORTON", true)
+    elseif term == "both" or term == "skeletons+morton" then
+        setTargetEnabled("SKELETONS", true)
+        setTargetEnabled("MORTON", true)
     elseif term ~= "" then
-        status.Text = "Search: slime, skeleton, all"
+        status.Text = "Choose Slimes, Skeletons, or Morton"
     end
     searchBox.Text = ""
 end)
+
+refreshTargetSwitches()
 
 -- ==========================================
 -- Character + target detection
@@ -610,28 +645,62 @@ end
 
 local function isSpawnMarkerName(name)
     local lowered = string.lower(name)
-    local forbidden = {"spawn", "spawner", "marker", "template", "dummy", "statue", "display", "shop", "merchant", "trader"}
+    local forbidden = {"spawn", "spawner", "marker", "template", "dummy", "statue", "display", "shop", "merchant", "trader", "arena", "island", "portal", "pedestal"}
     for _, word in ipairs(forbidden) do
         if string.find(lowered, word, 1, true) then return true end
     end
     return false
 end
 
+-- The boss may be a Model or a directly named Part like ABOVE's slimes.
+-- Prefer a named boss Model over one of its child parts; never target a map container.
+local function isMortonName(name)
+    return string.find(string.lower(name), CONFIG.BossKeyword, 1, true) ~= nil
+end
+
 local function getTargetKind(target)
     if not target then return nil end
     local lowered = string.lower(target.Name)
+    if isSpawnMarkerName(lowered) then return nil end
 
     if target:IsA("BasePart") then
         if CONFIG.MobNames[lowered] then return "SLIMES" end
-        if string.find(lowered, CONFIG.SkeletonKeyword, 1, true) and not isSpawnMarkerName(lowered) then
-            local parentModel = target:FindFirstAncestorOfClass("Model")
-            if parentModel and string.find(string.lower(parentModel.Name), CONFIG.SkeletonKeyword, 1, true) then
+        local parentModel = target:FindFirstAncestorOfClass("Model")
+
+        if isMortonName(lowered) then
+            -- If a Morton-named Model contains this Part, target that Model.
+            if parentModel and isMortonName(parentModel.Name)
+                and not isSpawnMarkerName(parentModel.Name) then
+                return nil
+            end
+            return "MORTON"
+        end
+
+        if string.find(lowered, CONFIG.SkeletonKeyword, 1, true) then
+            if parentModel and string.find(string.lower(parentModel.Name),
+                CONFIG.SkeletonKeyword, 1, true) then
                 return nil
             end
             return "SKELETONS"
         end
-    elseif target:IsA("Model") and string.find(lowered, CONFIG.SkeletonKeyword, 1, true) and not isSpawnMarkerName(lowered) then
-        return "SKELETONS"
+
+    elseif target:IsA("Model") then
+        if isMortonName(lowered) then
+            -- Avoid selecting both an outer Morton Model and its inner model.
+            local parent = target.Parent
+            while parent and parent ~= workspace do
+                if parent:IsA("Model") and isMortonName(parent.Name)
+                    and not isSpawnMarkerName(parent.Name) then
+                    return nil
+                end
+                parent = parent.Parent
+            end
+            return "MORTON"
+        end
+
+        if string.find(lowered, CONFIG.SkeletonKeyword, 1, true) then
+            return "SKELETONS"
+        end
     end
     return nil
 end
@@ -666,7 +735,7 @@ end
 local function validMob(target)
     local kind = getTargetKind(target)
     if not kind then return false end
-    if CONFIG.TargetMode ~= "ALL" and CONFIG.TargetMode ~= kind then return false end
+    if not CONFIG.EnabledTargets[kind] then return false end
     if not target:IsDescendantOf(workspace) then return false end
     if isPlayerPart(target) then return false end
     local root = getTargetRoot(target)
@@ -679,6 +748,11 @@ end
 local function isActiveMob(target, root, now)
     if not CONFIG.RequireMovement then return true end
     if getHealth(target) ~= nil then return true end
+    -- A movable Morton body is eligible even when its client-visible health is absent.
+    -- Anchored Morton-like parts must demonstrate movement like other mobs.
+    if getTargetKind(target) == "MORTON" and not root.Anchored then
+        return true
+    end
 
     local sample = motionSamples[target]
     local position = root.Position
@@ -746,6 +820,9 @@ inspectConnection = UIS.InputBegan:Connect(function(input, processed)
         print("[ABOVE] Nearest model:", model:GetFullName(), "class:", model.ClassName)
     end
     status.Text = "Inspect: " .. hit.Name .. (model and " / " .. model.Name or "")
+    if isMortonName(hit.Name) or (model and isMortonName(model.Name)) then
+        print("[ABOVE] Morton match found. Use target mode MORTON to farm it.")
+    end
 end)
 
 -- ==========================================
@@ -858,13 +935,20 @@ local function setEnabled(value)
     combatStartedAt = 0
     lastObservedProgress = 0
 
+    if enabled and selectedTargetNames() == "NONE" then
+        enabled = false
+        setToggleVisual(false)
+        status.Text = "Select Slimes, Skeletons or Morton"
+        return
+    end
+
     if enabled then
         oldCameraType = camera.CameraType
         oldCameraSubject = camera.CameraSubject
         lastAttack = 0
         setToggleVisual(true)
         pauseButton.Text = "Ⅱ"
-        status.Text = "Searching: " .. CONFIG.TargetMode
+        status.Text = "Searching: " .. selectedTargetNames()
         farmSub.Text = "Farm enabled; scanning for enemies."
     else
         setToggleVisual(false)
@@ -1088,7 +1172,7 @@ farmConnection = RunService.Heartbeat:Connect(function()
         -- Don't reset while idle with no enemies in range.
         combatStartedAt = 0
         lastObservedProgress = 0
-        status.Text = "Floating - scanning " .. CONFIG.TargetMode
+        status.Text = "Floating - scanning " .. selectedTargetNames()
         return
     end
 
@@ -1148,4 +1232,4 @@ farmConnection = RunService.Heartbeat:Connect(function()
     end
 end)
 
-print("[ABOVE] V9 ready: cleaner GUI + 10s no-progress reset")
+print("[ABOVE] V11 ready: individual Slimes / Skeletons / Morton toggles; Skeletons + Morton allowed")
