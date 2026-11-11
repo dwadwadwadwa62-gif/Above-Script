@@ -1,6 +1,8 @@
 --[[
     ABOVE | AUTO MOB FARM V11 - INDIVIDUAL TARGET TOGGLES
     - Slimes exclusive; Skeletons + Morton can be selected together
+    - Three GUI pages: Farming, Combat and Mining
+    - Farming/Mining target selection UI only; gathering logic not connected
     - Cleaner GUI inspired by user reference
     - B stops farming
     - Anti-AFK
@@ -38,7 +40,18 @@ local CONFIG = {
         SKELETONS = false,
         MORTON = false,
     },
-    SearchRange = 500,
+    -- Saved UI selections. Mining and harvesting automation are NOT wired yet.
+    FarmingTargets = {
+        BERRIES = false, ONIONS = false, CARROTS = false,
+        WHEAT = false, OTHER_CROPS = false,
+        FLOWERS = false, SHINIES = false,
+    },
+    MiningTargets = {
+        IRON = false, GOLD = false, COAL = false,
+        SAND = false, STONE = false, COPPER = false,
+        OTHER_ORES = false,
+    },
+    SearchRange = 100,
     MaxVerticalDifference = 50,
     HoverHeight = 12,
     MinHoverHeight = 6,
@@ -175,24 +188,30 @@ subtitle.TextColor3 = Color3.fromRGB(130, 136, 168)
 subtitle.Text = "Auto Farm"
 subtitle.Parent = sidebar
 
-local function navLabel(text, y, active)
-    local label = Instance.new("TextLabel")
-    label.BackgroundTransparency = 1
-    label.Position = UDim2.fromOffset(16, y)
-    label.Size = UDim2.fromOffset(88, 18)
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Font = active and Enum.Font.GothamBold or Enum.Font.Gotham
-    label.TextSize = 14
-    label.TextColor3 = active and Color3.fromRGB(244,244,248) or Color3.fromRGB(160, 164, 184)
-    label.Text = text
-    label.Parent = sidebar
-    return label
+-- Three actual navigation tabs (previous labels were not clickable).
+local navButtons = {}
+local function navButton(kind, text, y)
+    local button = Instance.new("TextButton")
+    button.Name = kind .. "Tab"
+    button.Size = UDim2.fromOffset(102, 34)
+    button.Position = UDim2.fromOffset(10, y)
+    button.BackgroundColor3 = Color3.fromRGB(26, 29, 48)
+    button.BackgroundTransparency = 1
+    button.BorderSizePixel = 0
+    button.TextXAlignment = Enum.TextXAlignment.Left
+    button.Text = "   " .. text
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 13
+    button.TextColor3 = Color3.fromRGB(158, 164, 189)
+    button.AutoButtonColor = true
+    button.Parent = sidebar
+    corner(button, 9)
+    navButtons[kind] = button
 end
 
-navLabel("Farms", 95, true)
-navLabel("Combat", 125, false)
-navLabel("Session", 155, false)
-navLabel("Settings", 185, false)
+navButton("FARMING", "Farming", 94)
+navButton("COMBAT", "Combat", 136)
+navButton("MINING", "Mining", 178)
 
 local content = Instance.new("Frame")
 content.Name = "Content"
@@ -208,6 +227,17 @@ topBar.Position = UDim2.fromOffset(10, 10)
 topBar.BackgroundTransparency = 1
 topBar.Parent = content
 
+local pageHeading = Instance.new("TextLabel")
+pageHeading.BackgroundTransparency = 1
+pageHeading.Position = UDim2.fromOffset(6, 6)
+pageHeading.Size = UDim2.fromOffset(128, 28)
+pageHeading.Text = "COMBAT"
+pageHeading.TextXAlignment = Enum.TextXAlignment.Left
+pageHeading.Font = Enum.Font.GothamBold
+pageHeading.TextSize = 15
+pageHeading.TextColor3 = Color3.fromRGB(233,233,247)
+pageHeading.Parent = topBar
+
 local searchBox = Instance.new("TextBox")
 searchBox.Name = "SearchBox"
 searchBox.Size = UDim2.fromOffset(170, 30)
@@ -215,7 +245,7 @@ searchBox.Position = UDim2.fromOffset(138, 4)
 searchBox.BackgroundColor3 = Color3.fromRGB(15, 18, 32)
 searchBox.BorderSizePixel = 0
 searchBox.ClearTextOnFocus = false
-searchBox.PlaceholderText = "Find target..."
+searchBox.PlaceholderText = "Combat target..."
 searchBox.Text = ""
 searchBox.TextColor3 = Color3.fromRGB(225,225,230)
 searchBox.PlaceholderColor3 = Color3.fromRGB(110, 116, 145)
@@ -247,7 +277,7 @@ local close = topMiniButton("X", 376, Color3.fromRGB(169, 57, 60))
 close.Name = "CloseButton"
 
 local card = Instance.new("Frame")
-card.Name = "FarmCard"
+card.Name = "CombatCard"
 card.Size = UDim2.new(1, -18, 0, 325)
 card.Position = UDim2.fromOffset(10, 58)
 card.BackgroundColor3 = Color3.fromRGB(14, 17, 30)
@@ -264,7 +294,7 @@ cardTitle.TextXAlignment = Enum.TextXAlignment.Left
 cardTitle.Font = Enum.Font.GothamBold
 cardTitle.TextSize = 17
 cardTitle.TextColor3 = Color3.fromRGB(244,244,248)
-cardTitle.Text = "Auto Farm"
+cardTitle.Text = "Combat Farm"
 cardTitle.Parent = card
 
 local cardSub = Instance.new("TextLabel")
@@ -337,7 +367,7 @@ local function row(y, labelText, subText)
 end
 
 -- Dedicated switches, matching the requested three-row target layout.
-local farmHolder, farmLabel, farmSub = row(58, "Auto Farm", "Start or pause farming.")
+local farmHolder, farmLabel, farmSub = row(58, "Auto Combat", "Start or pause mob farming.")
 local slimeHolder, slimeLabel, slimeSub = row(102, "Slimes", "Blue, Green, Pink and Orange")
 local skeletonHolder, skeletonLabel, skeletonSub = row(145, "Skeletons", "Can run alongside Morton")
 local mortonHolder, mortonLabel, mortonSub = row(188, "Morton", "Can run alongside Skeletons")
@@ -405,6 +435,165 @@ resetBadge.Text = "ON • 10s"
 resetBadge.Parent = card
 corner(resetBadge, 10)
 
+
+-- The status label is initialized below; keep its upvalue visible to callbacks.
+local status
+
+-- ==========================================
+-- Farming / Mining: selection pages
+-- ==========================================
+-- These switches persist during this script session. They do not mine or
+-- harvest until ABOVE's world objects and normal interactions are mapped.
+local function createResourcePage(pageName, heading, description, options, selections)
+    local page = Instance.new("Frame")
+    page.Name = pageName .. "Card"
+    page.Size = card.Size
+    page.Position = card.Position
+    page.BackgroundColor3 = card.BackgroundColor3
+    page.BorderSizePixel = 0
+    page.Visible = false
+    page.Parent = content
+    corner(page, 12)
+    stroke(page, Color3.fromRGB(43, 48, 72), 1, 0.25)
+
+    local pageTitle = Instance.new("TextLabel")
+    pageTitle.Size = UDim2.fromOffset(365, 24)
+    pageTitle.Position = UDim2.fromOffset(14, 9)
+    pageTitle.BackgroundTransparency = 1
+    pageTitle.Font = Enum.Font.GothamBold
+    pageTitle.TextSize = 17
+    pageTitle.TextColor3 = Color3.fromRGB(244, 244, 248)
+    pageTitle.TextXAlignment = Enum.TextXAlignment.Left
+    pageTitle.Text = heading
+    pageTitle.Parent = page
+
+    local pageSubtitle = Instance.new("TextLabel")
+    pageSubtitle.Size = UDim2.fromOffset(368, 19)
+    pageSubtitle.Position = UDim2.fromOffset(14, 31)
+    pageSubtitle.BackgroundTransparency = 1
+    pageSubtitle.Font = Enum.Font.Gotham
+    pageSubtitle.TextSize = 11
+    pageSubtitle.TextColor3 = Color3.fromRGB(136, 140, 164)
+    pageSubtitle.TextXAlignment = Enum.TextXAlignment.Left
+    pageSubtitle.Text = description
+    pageSubtitle.Parent = page
+
+    local note = Instance.new("TextLabel")
+    note.Size = UDim2.new(1, -26, 0, 24)
+    note.Position = UDim2.fromOffset(13, 54)
+    note.BackgroundColor3 = Color3.fromRGB(29, 27, 47)
+    note.BorderSizePixel = 0
+    note.Text = "SELECT TARGETS  •  AUTOMATION NOT CONNECTED YET"
+    note.Font = Enum.Font.GothamBold
+    note.TextSize = 10
+    note.TextColor3 = Color3.fromRGB(185, 172, 255)
+    note.Parent = page
+    corner(note, 7)
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Name = "TargetsList"
+    scroll.Size = UDim2.new(1, -26, 0, 233)
+    scroll.Position = UDim2.fromOffset(13, 84)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 4
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(100, 81, 180)
+    scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    scroll.CanvasSize = UDim2.fromOffset(0, #options * 47 + 4)
+    scroll.Parent = page
+
+    for index, option in ipairs(options) do
+        local key, labelText, subText = option[1], option[2], option[3]
+        local line = Instance.new("Frame")
+        line.Name = key .. "Row"
+        line.Size = UDim2.new(1, -10, 0, 45)
+        line.Position = UDim2.fromOffset(0, (index - 1) * 47)
+        line.BackgroundColor3 = Color3.fromRGB(19, 23, 39)
+        line.BorderSizePixel = 0
+        line.Parent = scroll
+        corner(line, 8)
+
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.fromOffset(275, 18)
+        label.Position = UDim2.fromOffset(11, 5)
+        label.BackgroundTransparency = 1
+        label.Text = labelText
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Font = Enum.Font.Gotham
+        label.TextSize = 13
+        label.TextColor3 = Color3.fromRGB(231, 231, 241)
+        label.Parent = line
+
+        local sub = Instance.new("TextLabel")
+        sub.Size = UDim2.fromOffset(285, 13)
+        sub.Position = UDim2.fromOffset(11, 24)
+        sub.BackgroundTransparency = 1
+        sub.Text = subText
+        sub.TextXAlignment = Enum.TextXAlignment.Left
+        sub.Font = Enum.Font.Gotham
+        sub.TextSize = 10
+        sub.TextColor3 = Color3.fromRGB(130, 136, 165)
+        sub.Parent = line
+
+        local button, knob = makeSwitch(line, 296, 8, selections[key])
+        button.Name = key .. "Toggle"
+        button.MouseButton1Click:Connect(function()
+            if not alive then return end
+            selections[key] = not selections[key]
+            setSwitchVisual(button, knob, selections[key])
+            status.Text = pageName .. " filters saved (automation pending)"
+        end)
+    end
+    return page
+end
+
+local farmingCard = createResourcePage("FARMING", "Auto Harvest", "Choose crops and collectible types.", {
+    {"BERRIES", "Berry Bushes", "Berries and harvestable berry plants"},
+    {"ONIONS", "Onions", "Onion crops"},
+    {"CARROTS", "Carrots", "Carrot crops"},
+    {"WHEAT", "Wheat", "Wheat crops"},
+    {"OTHER_CROPS", "Other Crops", "Additional crops (to be identified)"},
+    {"FLOWERS", "Flowers", "World flowers and pickups"},
+    {"SHINIES", "Shinies", "Collectible shiny items"},
+}, CONFIG.FarmingTargets)
+
+local miningCard = createResourcePage("MINING", "Auto Mining", "Choose which materials to target.", {
+    {"IRON", "Iron", "Iron ore deposits"},
+    {"GOLD", "Gold", "Gold ore deposits"},
+    {"COAL", "Coal", "Coal deposits"},
+    {"SAND", "Sand", "Sand resource blocks"},
+    {"STONE", "Stone", "Stone resource blocks"},
+    {"COPPER", "Copper", "If present in ABOVE"},
+    {"OTHER_ORES", "Other Ores", "More ore types (to be identified)"},
+}, CONFIG.MiningTargets)
+
+local pageCards = {FARMING = farmingCard, COMBAT = card, MINING = miningCard}
+local currentPage = "COMBAT"
+local function showPage(pageName)
+    if not pageCards[pageName] then return end
+    currentPage = pageName
+    for kind, page in pairs(pageCards) do
+        page.Visible = (kind == pageName)
+    end
+    for kind, button in pairs(navButtons) do
+        local selected = kind == pageName
+        button.BackgroundTransparency = selected and 0 or 1
+        button.BackgroundColor3 = Color3.fromRGB(46, 39, 82)
+        button.TextColor3 = selected and Color3.fromRGB(248, 247, 255)
+            or Color3.fromRGB(158, 164, 189)
+    end
+    pageHeading.Text = pageName
+    searchBox.Visible = (pageName == "COMBAT")
+    pauseButton.Visible = (pageName == "COMBAT")
+end
+
+for kind, button in pairs(navButtons) do
+    button.MouseButton1Click:Connect(function()
+        if alive then showPage(kind) end
+    end)
+end
+showPage("COMBAT")
+
 local statusPanel = Instance.new("Frame")
 statusPanel.Size = UDim2.new(1, -18, 0, 54)
 statusPanel.Position = UDim2.fromOffset(10, 392)
@@ -414,7 +603,7 @@ statusPanel.Parent = content
 corner(statusPanel, 12)
 stroke(statusPanel, Color3.fromRGB(43, 48, 72), 1, 0.25)
 
-local status = Instance.new("TextLabel")
+status = Instance.new("TextLabel")
 status.BackgroundTransparency = 1
 status.Position = UDim2.fromOffset(12, 8)
 status.Size = UDim2.fromOffset(250, 18)
@@ -949,12 +1138,12 @@ local function setEnabled(value)
         setToggleVisual(true)
         pauseButton.Text = "Ⅱ"
         status.Text = "Searching: " .. selectedTargetNames()
-        farmSub.Text = "Farm enabled; scanning for enemies."
+        farmSub.Text = "Combat enabled; scanning for enemies."
     else
         setToggleVisual(false)
         pauseButton.Text = "▶"
         status.Text = "Status: Idle"
-        farmSub.Text = "Farm paused; floating released."
+        farmSub.Text = "Combat paused; floating released."
         releaseHover()
         restoreCamera()
     end
@@ -1033,16 +1222,18 @@ end)
 local collapsed = false
 minimize.MouseButton1Click:Connect(function()
     collapsed = not collapsed
-    card.Visible = not collapsed
-    statusPanel.Visible = not collapsed
-    main.Size = UDim2.fromOffset(560, collapsed and 60 or 345)
-    sidebar.Size = UDim2.fromOffset(120, collapsed and 60 or 345)
-    sidebarMask.Size = UDim2.fromOffset(22, collapsed and 60 or 345)
-    for _, child in ipairs(sidebar:GetChildren()) do
-        if child:IsA("TextLabel") and child ~= brand and child ~= subtitle then
-            child.Visible = not collapsed
-        end
+    for _, page in pairs(pageCards) do
+        page.Visible = false
     end
+    if not collapsed then showPage(currentPage) end
+    statusPanel.Visible = not collapsed
+    main.Size = UDim2.fromOffset(560, collapsed and 60 or 458)
+    sidebar.Size = UDim2.fromOffset(120, collapsed and 60 or 458)
+    sidebarMask.Size = UDim2.fromOffset(22, collapsed and 60 or 458)
+    for _, button in pairs(navButtons) do
+        button.Visible = not collapsed
+    end
+    antiAfkText.Visible = not collapsed
     minimize.Text = collapsed and "+" or "–"
 end)
 
