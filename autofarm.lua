@@ -51,7 +51,7 @@ local CONFIG = {
         SAND = false, STONE = false, COPPER = false,
         OTHER_ORES = false,
     },
-    SearchRange = 100,
+    SearchRange = 500,
     MaxVerticalDifference = 50,
     HoverHeight = 12,
     MinHoverHeight = 6,
