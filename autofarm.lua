@@ -1,6 +1,7 @@
 --[[
     ABOVE | AUTO MOB FARM V11 - INDIVIDUAL TARGET TOGGLES
     - Slimes exclusive; Skeletons + Morton can be selected together
+    - V29: Morton-named stationary targets are detectable; P on Morton locks boss, Shift+P manual override
     - V28: Flower targeting excludes shinies; Shinies use G; fly-and-drop kept from V27
     - V26: Filter decorative flower pots; route Farming around walls via PathfindingService
     - V25: Boss-only scan range, longer encounter, Shift+P manual Morton lock
@@ -38,7 +39,7 @@ local CONFIG = {
         orangeslime = true,
     },
     SkeletonKeyword = "skeleton",
-    BossKeyword = "morton", -- Name-based detection; Shift+P can lock a different boss model.
+    BossKeyword = "morton", -- Name-based detection; P locks Morton, Shift+P forces a manual lock.
     MortonSearchRange = 250, -- Boss-only range. Normal Combat stays at 100 studs.
     MortonMaxVerticalDifference = 125,
     MortonHoverHeight = 5, -- Lower than normal Combat: boss hitboxes may be tall.
@@ -496,7 +497,7 @@ end
 local farmHolder, farmLabel, farmSub = row(58, "Auto Combat", "Start or pause mob farming.")
 local slimeHolder, slimeLabel, slimeSub = row(102, "Slimes", "Blue, Green, Pink and Orange")
 local skeletonHolder, skeletonLabel, skeletonSub = row(145, "Skeletons", "Can run alongside Morton")
-local mortonHolder, mortonLabel, mortonSub = row(188, "Morton", "Shift+P over boss to lock a target")
+local mortonHolder, mortonLabel, mortonSub = row(188, "Morton", "Aim at Morton + press P to lock; Shift+P for manual lock")
 local heightHolder, heightLabel, heightSub = row(231, "Hover Height", "Adjust floating clearance.")
 local resetHolder, resetLabel, resetSub = row(274, "10s Stall Reset", "Resets if no damage/kill is detected.")
 
@@ -1168,15 +1169,11 @@ end
 local function isActiveMob(target, root, now)
     if not CONFIG.RequireMovement then return true end
     if getHealth(target) ~= nil then return true end
-    -- A locked boss, living Morton Model, or non-anchored boss can be targeted
-    -- even when the game hides its HP and movement replication.
-    if getTargetKind(target) == "MORTON" then
-        if target == CONFIG.MortonPinnedTarget then return true end
-        if target:IsA("Model") and target:FindFirstChildWhichIsA("Humanoid", true) then
-            return true
-        end
-        if not root.Anchored then return true end
-    end
+    -- Morton can be an anchored Part/Model with no client-visible health.
+    -- Unlike generic mobs, a clearly named Morton target must not be
+    -- discarded just because it has not moved on this client.
+    -- validMob() has already checked name, workspace, player ownership, and HP.
+    if getTargetKind(target) == "MORTON" then return true end
 
     local sample = motionSamples[target]
     local position = root.Position
@@ -1209,6 +1206,13 @@ local function withinRange(target, root)
 end
 
 local function findNearestMob(root, now)
+    -- A user-selected Morton takes priority over automatically chosen mobs.
+    -- The manual lock is only used while Morton is enabled and close enough.
+    local pinned = CONFIG.MortonPinnedTarget
+    if CONFIG.EnabledTargets.MORTON and pinned and pinned.Parent
+        and withinRange(pinned, root) then
+        return pinned
+    end
     local nearest = nil
     local shortest = math.max(CONFIG.SearchRange, CONFIG.MortonSearchRange)
 
@@ -1248,38 +1252,42 @@ inspectConnection = UIS.InputBegan:Connect(function(input, processed)
     if model then
         print("[ABOVE] Nearest model:", model:GetFullName(), "class:", model.ClassName)
     end
-    -- P alone retains the original harmless inspector behavior.
-    -- Shift+P explicitly locks the boss Model under the mouse for this session.
-    if UIS:IsKeyDown(Enum.KeyCode.LeftShift)
-        or UIS:IsKeyDown(Enum.KeyCode.RightShift) then
-        if not CONFIG.EnabledTargets.MORTON then
-            status.Text = "Enable the Morton toggle before Shift+P"
-            return
+    -- P on a named Morton now locks it directly; the previous P-only action
+    -- just inspected without locking, which could be misleading. Shift+P
+    -- remains available as an explicit override for oddly named boss models.
+    local forced = UIS:IsKeyDown(Enum.KeyCode.LeftShift)
+        or UIS:IsKeyDown(Enum.KeyCode.RightShift)
+    local namedBoss = isMortonName(hit.Name)
+    local namedModel = nil
+    local ancestor = model
+    while ancestor and ancestor ~= workspace do
+        if ancestor:IsA("Model") and isMortonName(ancestor.Name) then
+            namedBoss = true
+            namedModel = ancestor
+            break
         end
-        local selected = model or hit
-        local ancestor = model
-        while ancestor and ancestor ~= workspace do
-            if ancestor:IsA("Model") and isMortonName(ancestor.Name) then
-                selected = ancestor
-                break
-            end
-            ancestor = ancestor.Parent
-        end
-        if selected:IsA("Model") and not getTargetRoot(selected) then
+        ancestor = ancestor.Parent
+    end
+    if (namedBoss or forced) and CONFIG.EnabledTargets.MORTON then
+        local selected = namedModel or (isMortonName(hit.Name) and hit) or model or hit
+        if not getTargetRoot(selected) then
             status.Text = "Morton lock failed: no body part in " .. selected.Name
             return
         end
         CONFIG.MortonPinnedTarget = selected
+        ignoredUntil[selected] = nil
         currentTarget = nil
         targetSince = 0
         lastScan = -math.huge
         status.Text = "Morton locked: " .. selected.Name
-        print("[ABOVE] MORTON LOCK:", selected:GetFullName(), "(Shift+P again to change)")
+        print("[ABOVE] MORTON LOCK:", selected:GetFullName(), "(press P while aiming at Morton)")
         return
     end
     status.Text = "Inspect: " .. hit.Name .. (model and " / " .. model.Name or "")
-    if isMortonName(hit.Name) or (model and isMortonName(model.Name)) then
-        print("[ABOVE] Morton name detected; enable MORTON to attack.")
+    if namedBoss then
+        print("[ABOVE] Named Morton detected. Enable MORTON, then press P again to lock.")
+    elseif forced then
+        status.Text = "Enable Morton toggle before manual Shift+P lock"
     end
 end)
 
@@ -3068,4 +3076,4 @@ farmConnection = RunService.Heartbeat:Connect(function()
     end
 end)
 
-print("[ABOVE] V26 ready: Farming skips decorative flower pots and follows walkable paths around walls. Combat and Mining unchanged.")
+print("[ABOVE] V29 ready: Morton stationary-target filter fixed; press P while pointing at Morton to lock. Farming/Mining unchanged.")
