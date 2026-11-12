@@ -1,6 +1,7 @@
 --[[
     ABOVE | AUTO MOB FARM V11 - INDIVIDUAL TARGET TOGGLES
     - Slimes exclusive; Skeletons + Morton can be selected together
+    - V26: Filter decorative flower pots; route Farming around walls via PathfindingService
     - V25: Boss-only scan range, longer encounter, Shift+P manual Morton lock
     - Three GUI pages: Farming, Combat and Mining
     - Mining: six selectable resources with Wood/Stone/Iron+ pickaxe tier checks, overhead clicks, mob avoidance
@@ -61,6 +62,10 @@ local CONFIG = {
     FarmingWalkSpeed = 34,       -- Default Roblox walking is often 16; only while Farming is ON
     FarmingInteractDistance = 3.5, -- Get closer to plants before sending F; must be within game interaction range
     FarmingMoveRefresh = 0.35,   -- Do not spam Humanoid:MoveTo every Heartbeat
+    FarmingWaypointReach = 2.8, -- Progress to next pathfinding waypoint
+    FarmingPathStuckSeconds = 2.5,
+    FarmingPathMinProgress = 1.5,
+    FarmingPathMaxRetries = 3, -- Skip unreachable plants rather than run into walls
     FarmingClickDelay = 0.38,    -- Flower/shiny pickup attempts
     FarmingFKeyDelay = 0.52,     -- Repeated F pulses near crops, held F while travelling
     -- Replant after a harvested crop object actually disappears. Berries/flowers/shinies never replant.
@@ -156,6 +161,18 @@ CONFIG.FarmingMotion = {
     harvestAttempted = false,
     pendingReplant = nil,
     replantBusy = false,
+    routeGeneration = 0,
+    routeBusy = false,
+    routeTarget = nil,
+    routeWaypoints = nil,
+    routeIndex = 1,
+    routeObject = nil,
+    routeBlocked = nil,
+    routeNeedsReplan = false,
+    routeRequestedAt = -math.huge,
+    routeLastProgress = 0,
+    routeLastPosition = nil,
+    routeRetries = 0,
 }
 local farmingEvadePosition = nil
 local farmingIgnoreUntil = setmetatable({}, { __mode = "k" })
@@ -1771,11 +1788,35 @@ local function farmCategoryOfName(name)
     return nil
 end
 
+-- Exclude ornamental flowers/potted plants from the collectible flower pool.
+-- A name match alone is NOT evidence that a plant is a world pickup.
+CONFIG.FarmingMotion.isDecoration = function(obj)
+    local node = obj
+    while node and node ~= workspace do
+        local n = compactFarmName(node.Name)
+        if n == "pot" or n == "pots" or n == "props"
+            or n == "decor" or n == "decorations" or n == "scenery"
+            or n:find("flowerpot", 1, true)
+            or n:find("potted", 1, true)
+            or n:find("planter", 1, true)
+            or n:find("vase", 1, true)
+            or n:find("decorative", 1, true)
+            or n:find("fakeflower", 1, true)
+            or n:find("displayflower", 1, true)
+            or n:find("houseplant", 1, true) then
+            return true
+        end
+        node = node.Parent
+    end
+    return false
+end
+
 local function farmCandidate(obj)
     if not (obj:IsA("Model") or obj:IsA("BasePart")) then return nil end
     if not obj:IsDescendantOf(workspace) or isPlayerPart(obj) then return nil end
     local category = farmCategoryOfName(obj.Name)
     if not category or not CONFIG.FarmingTargets[category] then return nil end
+    if category == "FLOWERS" and CONFIG.FarmingMotion.isDecoration(obj) then return nil end
     -- Prefer the named outer model over its named child parts; scan it once.
     local ancestor = obj.Parent
     while ancestor and ancestor ~= workspace do
@@ -1911,11 +1952,80 @@ CONFIG.FarmingMotion.setFKey = function(shouldHold)
     end
 end
 
+-- Clear navigation when the target or farming mode changes. A generation ID
+-- invalidates any ComputeAsync task that is still finishing in the background.
+CONFIG.FarmingMotion.clearRoute = function()
+    local m = CONFIG.FarmingMotion
+    m.routeGeneration = m.routeGeneration + 1
+    if m.routeBlocked then pcall(function() m.routeBlocked:Disconnect() end) end
+    if m.routeObject then pcall(function() m.routeObject:Destroy() end) end
+    m.routeBlocked = nil
+    m.routeObject = nil
+    m.routeWaypoints = nil
+    m.routeTarget = nil
+    m.routeIndex = 1
+    m.routeBusy = false
+    m.routeNeedsReplan = false
+    m.routeLastPosition = nil
+    m.routeLastProgress = 0
+end
+
 local function stopFarmingInteractions()
     farmingInteractionGeneration = farmingInteractionGeneration + 1
     CONFIG.FarmingMotion.setFKey(false)
+    CONFIG.FarmingMotion.clearRoute()
     CONFIG.FarmingMotion.arrived = false
     CONFIG.FarmingMotion.rearmAt = 0
+end
+
+-- Compute world navigation asynchronously so the Heartbeat loop doesn't block.
+-- Uses walkable paths only: if a wall makes a plant unreachable, skip it.
+CONFIG.FarmingMotion.requestRoute = function(fromPosition, destination, target)
+    local m = CONFIG.FarmingMotion
+    if m.routeBusy then return end
+    m.routeBusy = true
+    m.routeTarget = target
+    m.routeRequestedAt = os.clock()
+    local generation = m.routeGeneration
+    task.spawn(function()
+        local path
+        local ok = pcall(function()
+            path = game:GetService("PathfindingService"):CreatePath({
+                AgentRadius = 2,
+                AgentHeight = 5,
+                AgentCanJump = true,
+                AgentCanClimb = false,
+                WaypointSpacing = 4,
+            })
+            path:ComputeAsync(fromPosition, destination)
+        end)
+        if generation ~= m.routeGeneration or not alive or not farmingEnabled or farmingTarget ~= target then
+            if path then pcall(function() path:Destroy() end) end
+            return
+        end
+        m.routeBusy = false
+        if ok and path and path.Status == Enum.PathStatus.Success then
+            local points = path:GetWaypoints()
+            if #points >= 1 then
+                m.routeObject = path
+                m.routeWaypoints = points
+                m.routeIndex = #points > 1 and 2 or 1
+                m.routeLastPosition = fromPosition
+                m.routeLastProgress = os.clock()
+                m.routeBlocked = path.Blocked:Connect(function(blockedIndex)
+                    if blockedIndex >= m.routeIndex then m.routeNeedsReplan = true end
+                end)
+                return
+            end
+        end
+        if path then pcall(function() path:Destroy() end) end
+        farmingIgnoreUntil[target] = os.clock() + CONFIG.FarmingRetryDelay
+        if farmingTarget == target then
+            farmingTarget, farmingTargetCategory = nil, nil
+            stopFarmingInteractions()
+            status.Text = "Farming: no walkable path; skipping plant"
+        end
+    end)
 end
 
 setFarmingEnabled = function(value)
@@ -1936,6 +2046,7 @@ setFarmingEnabled = function(value)
     CONFIG.FarmingMotion.pendingReplant = nil
     CONFIG.FarmingMotion.targetDeadline = 0
     CONFIG.FarmingMotion.arrivedAt = 0
+    CONFIG.FarmingMotion.routeRetries = 0
     farmingLastScan = -math.huge
     farmingEvadePosition = nil
     stopFarmingInteractions()
@@ -2028,7 +2139,13 @@ local function farmInteract(expectedTarget, part)
                 fireclickdetector(detector)
                 return
             end
-            -- For world pickups, hovering close is part of the interaction.
+            -- Some world flowers use the same context-action F key as crops.
+            -- Try it only after reaching a real (non-decoration) flower.
+            if farmingTargetCategory == "FLOWERS" then
+                CONFIG.FarmingMotion.setFKey(true)
+                task.wait(0.09)
+                CONFIG.FarmingMotion.setFKey(false)
+            end
             -- A click is attempted as fallback if no prompt or detector is exposed.
             local viewport = camera.ViewportSize
             local x, y = math.floor(viewport.X / 2), math.floor(viewport.Y / 2)
@@ -2211,6 +2328,7 @@ local function updateFarming(root)
         if farmingTarget then
             CONFIG.FarmingMotion.harvestAttempted = false
             CONFIG.FarmingMotion.harvestPoint = nil
+            CONFIG.FarmingMotion.routeRetries = 0
             local _, part = farmCandidate(farmingTarget)
             local travelDistance = part and (part.Position - root.Position).Magnitude or 0
             local travelSeconds = travelDistance / math.max(CONFIG.FarmingWalkSpeed, 1)
@@ -2283,21 +2401,71 @@ local function updateFarming(root)
     local isCrop = category ~= "FLOWERS" and category ~= "SHINIES"
 
     if not inRange then
-        CONFIG.FarmingMotion.arrived = false
-        -- Hold F while travelling; on arrival briefly release/re-hold to
-        -- trigger interfaces listening for a NEW F key-down within range.
-        CONFIG.FarmingMotion.setFKey(isCrop)
-        if now - CONFIG.FarmingMotion.lastMoveCommand >= CONFIG.FarmingMoveRefresh then
-            CONFIG.FarmingMotion.lastMoveCommand = now
-            local approach = horizontal.Magnitude > 0.1 and horizontal.Unit or Vector3.new(1, 0, 0)
-            -- Aim beside the plant on WALKABLE GROUND, not on top of the bush.
-            local destination = Vector3.new(desired.X, desired.Y, desired.Z) - approach * 2
-            humanoid:MoveTo(destination)
+        local motion = CONFIG.FarmingMotion
+        motion.arrived = false
+        -- Keep existing crop F-hold behavior, but walk via computed waypoints.
+        motion.setFKey(isCrop)
+        if motion.routeTarget ~= farmingTarget or motion.routeNeedsReplan then
+            if motion.routeNeedsReplan then motion.routeRetries = motion.routeRetries + 1 end
+            motion.clearRoute()
+            if motion.routeRetries > CONFIG.FarmingPathMaxRetries then
+                farmingIgnoreUntil[farmingTarget] = now + CONFIG.FarmingRevisitDelay
+                farmingTarget, farmingTargetCategory = nil, nil
+                stopFarmingInteractions()
+                status.Text = "Farming: skipped unreachable plant"
+                return
+            end
         end
-        status.Text = "Farming: running (speed " .. CONFIG.FarmingWalkSpeed
-            .. ") toward " .. farmingTarget.Name
+        if not motion.routeWaypoints and not motion.routeBusy then
+            if now - motion.routeRequestedAt >= 0.75 then
+                local approach = horizontal.Magnitude > 0.1 and horizontal.Unit or Vector3.new(1, 0, 0)
+                -- Keep the path endpoint outside the plant's collision volume.
+                local destination = desired - approach * 2.5
+                motion.requestRoute(root.Position, destination, farmingTarget)
+            end
+            status.Text = "Farming: finding a route to " .. farmingTarget.Name
+            return
+        end
+        if motion.routeBusy then
+            status.Text = "Farming: planning route around walls"
+            return
+        end
+        local waypoint = motion.routeWaypoints and motion.routeWaypoints[motion.routeIndex]
+        if waypoint then
+            local offset = waypoint.Position - root.Position
+            local flatDistance = Vector2.new(offset.X, offset.Z).Magnitude
+            if flatDistance <= CONFIG.FarmingWaypointReach and math.abs(offset.Y) <= 6 then
+                motion.routeIndex = motion.routeIndex + 1
+                waypoint = motion.routeWaypoints[motion.routeIndex]
+                motion.routeLastProgress = now
+                motion.routeLastPosition = root.Position
+            end
+        end
+        if not waypoint then
+            motion.routeNeedsReplan = true
+            return
+        end
+        if motion.routeLastPosition and now - motion.routeLastProgress >= CONFIG.FarmingPathStuckSeconds then
+            if (root.Position - motion.routeLastPosition).Magnitude < CONFIG.FarmingPathMinProgress then
+                motion.routeNeedsReplan = true
+                status.Text = "Farming: rerouting around obstacle"
+                return
+            end
+            motion.routeLastProgress = now
+            motion.routeLastPosition = root.Position
+        end
+        if now - motion.lastMoveCommand >= CONFIG.FarmingMoveRefresh then
+            motion.lastMoveCommand = now
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                humanoid.Jump = true
+            end
+            humanoid:MoveTo(waypoint.Position)
+        end
+        status.Text = "Farming: following path to " .. farmingTarget.Name
         return
     end
+    -- We reached the pickup, so no more route computation is necessary.
+    if CONFIG.FarmingMotion.routeWaypoints then CONFIG.FarmingMotion.clearRoute() end
 
     if not CONFIG.FarmingMotion.arrived then
         CONFIG.FarmingMotion.arrived = true
@@ -2764,4 +2932,4 @@ farmConnection = RunService.Heartbeat:Connect(function()
     end
 end)
 
-print("[ABOVE] V25 ready: Morton targeting improved. In Combat enable Morton; Shift+P while pointing at boss to lock it. Mining and Farming unchanged.")
+print("[ABOVE] V26 ready: Farming skips decorative flower pots and follows walkable paths around walls. Combat and Mining unchanged.")
