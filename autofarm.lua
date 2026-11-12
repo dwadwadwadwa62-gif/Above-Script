@@ -1,6 +1,7 @@
 --[[
     ABOVE | AUTO MOB FARM V11 - INDIVIDUAL TARGET TOGGLES
     - Slimes exclusive; Skeletons + Morton can be selected together
+    - V25: Boss-only scan range, longer encounter, Shift+P manual Morton lock
     - Three GUI pages: Farming, Combat and Mining
     - Mining: six selectable resources with Wood/Stone/Iron+ pickaxe tier checks, overhead clicks, mob avoidance
     - NOTE: Auto Mining requires the Roblox window to remain focused (does not work tabbed out).
@@ -35,7 +36,12 @@ local CONFIG = {
         orangeslime = true,
     },
     SkeletonKeyword = "skeleton",
-    BossKeyword = "morton", -- Matches Parts/Models containing Morton (case-insensitive)
+    BossKeyword = "morton", -- Name-based detection; Shift+P can lock a different boss model.
+    MortonSearchRange = 250, -- Boss-only range. Normal Combat stays at 100 studs.
+    MortonMaxVerticalDifference = 125,
+    MortonHoverHeight = 5, -- Lower than normal Combat: boss hitboxes may be tall.
+    MortonMaxTargetSeconds = 65, -- Allow long boss fights before skipping the target.
+    MortonPinnedTarget = nil, -- Set by Shift+P while pointing at Morton; session-only.
     -- Separate target switches. Slimes run alone; Skeletons + Morton can run together.
     EnabledTargets = {
         SLIMES = true,
@@ -464,7 +470,7 @@ end
 local farmHolder, farmLabel, farmSub = row(58, "Auto Combat", "Start or pause mob farming.")
 local slimeHolder, slimeLabel, slimeSub = row(102, "Slimes", "Blue, Green, Pink and Orange")
 local skeletonHolder, skeletonLabel, skeletonSub = row(145, "Skeletons", "Can run alongside Morton")
-local mortonHolder, mortonLabel, mortonSub = row(188, "Morton", "Can run alongside Skeletons")
+local mortonHolder, mortonLabel, mortonSub = row(188, "Morton", "Shift+P over boss to lock a target")
 local heightHolder, heightLabel, heightSub = row(231, "Hover Height", "Adjust floating clearance.")
 local resetHolder, resetLabel, resetSub = row(274, "10s Stall Reset", "Resets if no damage/kill is detected.")
 
@@ -1044,6 +1050,10 @@ end
 
 local function getTargetKind(target)
     if not target then return nil end
+    -- Explicit lock bypasses unknown/nonstandard Morton model names.
+    if target == CONFIG.MortonPinnedTarget and target:IsDescendantOf(workspace) then
+        return "MORTON"
+    end
     local lowered = string.lower(target.Name)
     if isSpawnMarkerName(lowered) then return nil end
 
@@ -1132,10 +1142,14 @@ end
 local function isActiveMob(target, root, now)
     if not CONFIG.RequireMovement then return true end
     if getHealth(target) ~= nil then return true end
-    -- A movable Morton body is eligible even when its client-visible health is absent.
-    -- Anchored Morton-like parts must demonstrate movement like other mobs.
-    if getTargetKind(target) == "MORTON" and not root.Anchored then
-        return true
+    -- A locked boss, living Morton Model, or non-anchored boss can be targeted
+    -- even when the game hides its HP and movement replication.
+    if getTargetKind(target) == "MORTON" then
+        if target == CONFIG.MortonPinnedTarget then return true end
+        if target:IsA("Model") and target:FindFirstChildWhichIsA("Humanoid", true) then
+            return true
+        end
+        if not root.Anchored then return true end
     end
 
     local sample = motionSamples[target]
@@ -1159,24 +1173,28 @@ local function isActiveMob(target, root, now)
 end
 
 local function withinRange(target, root)
-    local valid, mobRoot = validMob(target)
+    local valid, mobRoot, kind = validMob(target)
     if not root or not valid then return false end
     local difference = mobRoot.Position - root.Position
-    return difference.Magnitude <= CONFIG.SearchRange
-        and math.abs(difference.Y) <= math.max(CONFIG.MaxVerticalDifference, CONFIG.HoverHeight + 8)
+    local range = kind == "MORTON" and CONFIG.MortonSearchRange or CONFIG.SearchRange
+    local vertical = kind == "MORTON" and CONFIG.MortonMaxVerticalDifference
+        or math.max(CONFIG.MaxVerticalDifference, CONFIG.HoverHeight + 8)
+    return difference.Magnitude <= range and math.abs(difference.Y) <= vertical
 end
 
 local function findNearestMob(root, now)
     local nearest = nil
-    local shortest = CONFIG.SearchRange
+    local shortest = math.max(CONFIG.SearchRange, CONFIG.MortonSearchRange)
 
     for _, obj in ipairs(workspace:GetDescendants()) do
-        local valid, mobRoot = validMob(obj)
+        local valid, mobRoot, kind = validMob(obj)
         if valid then
             local difference = mobRoot.Position - root.Position
             local distance = difference.Magnitude
-            if distance < CONFIG.SearchRange
-                and math.abs(difference.Y) <= math.max(CONFIG.MaxVerticalDifference, CONFIG.HoverHeight + 8) then
+            local range = kind == "MORTON" and CONFIG.MortonSearchRange or CONFIG.SearchRange
+            local vertical = kind == "MORTON" and CONFIG.MortonMaxVerticalDifference
+                or math.max(CONFIG.MaxVerticalDifference, CONFIG.HoverHeight + 8)
+            if distance < range and math.abs(difference.Y) <= vertical then
                 local active = isActiveMob(obj, mobRoot, now)
                 local ignored = (ignoredUntil[obj] or 0) > now
                 if active and not ignored and distance < shortest then
@@ -1196,6 +1214,7 @@ inspectConnection = UIS.InputBegan:Connect(function(input, processed)
     local hit = mouse.Target
     if not hit then
         print("[ABOVE] Inspector: no part under cursor")
+        status.Text = "Morton lock: aim directly at the boss first"
         return
     end
     print("[ABOVE] Hit:", hit:GetFullName(), "class:", hit.ClassName)
@@ -1203,9 +1222,38 @@ inspectConnection = UIS.InputBegan:Connect(function(input, processed)
     if model then
         print("[ABOVE] Nearest model:", model:GetFullName(), "class:", model.ClassName)
     end
+    -- P alone retains the original harmless inspector behavior.
+    -- Shift+P explicitly locks the boss Model under the mouse for this session.
+    if UIS:IsKeyDown(Enum.KeyCode.LeftShift)
+        or UIS:IsKeyDown(Enum.KeyCode.RightShift) then
+        if not CONFIG.EnabledTargets.MORTON then
+            status.Text = "Enable the Morton toggle before Shift+P"
+            return
+        end
+        local selected = model or hit
+        local ancestor = model
+        while ancestor and ancestor ~= workspace do
+            if ancestor:IsA("Model") and isMortonName(ancestor.Name) then
+                selected = ancestor
+                break
+            end
+            ancestor = ancestor.Parent
+        end
+        if selected:IsA("Model") and not getTargetRoot(selected) then
+            status.Text = "Morton lock failed: no body part in " .. selected.Name
+            return
+        end
+        CONFIG.MortonPinnedTarget = selected
+        currentTarget = nil
+        targetSince = 0
+        lastScan = -math.huge
+        status.Text = "Morton locked: " .. selected.Name
+        print("[ABOVE] MORTON LOCK:", selected:GetFullName(), "(Shift+P again to change)")
+        return
+    end
     status.Text = "Inspect: " .. hit.Name .. (model and " / " .. model.Name or "")
     if isMortonName(hit.Name) or (model and isMortonName(model.Name)) then
-        print("[ABOVE] Morton match found. Use target mode MORTON to farm it.")
+        print("[ABOVE] Morton name detected; enable MORTON to attack.")
     end
 end)
 
@@ -2610,7 +2658,8 @@ farmConnection = RunService.Heartbeat:Connect(function()
 
     -- Preserve anti-spawn and stuck target protection from V8.
     if currentTarget and targetSince > 0
-        and now - targetSince >= CONFIG.MaxTargetSeconds then
+        and now - targetSince >= (getTargetKind(currentTarget) == "MORTON"
+            and CONFIG.MortonMaxTargetSeconds or CONFIG.MaxTargetSeconds) then
         ignoredUntil[currentTarget] = now + CONFIG.StuckTargetCooldown
         currentTarget = nil
         targetSince = 0
@@ -2623,7 +2672,12 @@ farmConnection = RunService.Heartbeat:Connect(function()
         if currentTarget then
             targetSince = now
             targetHealthMemory[currentTarget] = getHealth(currentTarget)
-            if combatStartedAt == 0 then
+            if getTargetKind(currentTarget) == "MORTON" then
+                -- Boss fights may be long with hidden HP; prevent an unearned
+                -- 10-second character reset, while keeping target timeout.
+                combatStartedAt = 0
+                lastObservedProgress = 0
+            elseif combatStartedAt == 0 then
                 combatStartedAt = now
                 lastObservedProgress = now
             end
@@ -2647,14 +2701,30 @@ farmConnection = RunService.Heartbeat:Connect(function()
 
     -- Reset after a full 10s of combat with no OBSERVABLE damage/kill.
     -- Clicks alone are not treated as hits.
-    if combatStartedAt > 0 and now - lastObservedProgress >= CONFIG.NoHitResetSeconds then
+    if getTargetKind(currentTarget) ~= "MORTON"
+        and combatStartedAt > 0
+        and now - lastObservedProgress >= CONFIG.NoHitResetSeconds then
         resetCharacter("No damage/kill seen for 10s - reset")
         return
     end
 
     local targetPos = mobRoot.Position
     local topY = targetPos.Y + mobRoot.Size.Y * 0.5
-    if currentTarget:IsA("Model") then
+    local hoverHeight = CONFIG.HoverHeight
+    if getTargetKind(currentTarget) == "MORTON" then
+        -- A boss Model can contain tall VFX that make its bounding box far too
+        -- high for attacks to connect. Use its head/torso if available.
+        hoverHeight = CONFIG.MortonHoverHeight
+        if currentTarget:IsA("Model") then
+            local focus = currentTarget:FindFirstChild("Head", true)
+                or currentTarget:FindFirstChild("UpperTorso", true)
+                or currentTarget:FindFirstChild("Torso", true)
+            if focus and focus:IsA("BasePart") then
+                targetPos = focus.Position
+                topY = focus.Position.Y + focus.Size.Y * 0.5
+            end
+        end
+    elseif currentTarget:IsA("Model") then
         local ok, cf, size = pcall(function()
             return currentTarget:GetBoundingBox()
         end)
@@ -2666,7 +2736,7 @@ farmConnection = RunService.Heartbeat:Connect(function()
     local rootToFeet = hum.HipHeight + root.Size.Y * 0.5
     local hoverPos = Vector3.new(
         targetPos.X,
-        topY + rootToFeet + CONFIG.HoverHeight,
+        topY + rootToFeet + hoverHeight,
         targetPos.Z
     )
 
@@ -2694,4 +2764,4 @@ farmConnection = RunService.Heartbeat:Connect(function()
     end
 end)
 
-print("[ABOVE] V17 ready: 6 ores, automatic pickaxe tier limits, overhead click mining, mob avoidance")
+print("[ABOVE] V25 ready: Morton targeting improved. In Combat enable Morton; Shift+P while pointing at boss to lock it. Mining and Farming unchanged.")
