@@ -4,7 +4,7 @@
     - Three GUI pages: Farming, Combat and Mining
     - Mining: six selectable resources with Wood/Stone/Iron+ pickaxe tier checks, overhead clicks, mob avoidance
     - NOTE: Auto Mining requires the Roblox window to remain focused (does not work tabbed out).
-    - Farming selection UI only; harvesting logic not connected
+    - Farming: ground-level approach and repeated F pickup attempts; prompt fallback (experimental)
     - Cleaner GUI inspired by user reference
     - B stops farming
     - Anti-AFK
@@ -42,12 +42,34 @@ local CONFIG = {
         SKELETONS = false,
         MORTON = false,
     },
-    -- Farming remains UI-only; mining uses exact Model-name mappings below.
+    -- Farming uses best-effort name matching and common pickup/click/prompt actions.
+    -- ABOVE's actual crop model names and harvest method have not been confirmed.
     FarmingTargets = {
         BERRIES = false, ONIONS = false, CARROTS = false,
         WHEAT = false, OTHER_CROPS = false,
         FLOWERS = false, SHINIES = false,
     },
+    -- Auto Harvest settings. Keep Farming independent from Mining and Combat.
+    FarmingSearchRange = math.huge, -- No distance cutoff for loaded/streamed-in plants
+    FarmingMaxVerticalDifference = math.huge, -- Allow plants at different elevations
+    FarmingWalkSpeed = 34,       -- Default Roblox walking is often 16; only while Farming is ON
+    FarmingInteractDistance = 3.5, -- Get closer to plants before sending F; must be within game interaction range
+    FarmingMoveRefresh = 0.35,   -- Do not spam Humanoid:MoveTo every Heartbeat
+    FarmingClickDelay = 0.38,    -- Flower/shiny pickup attempts
+    FarmingFKeyDelay = 0.52,     -- Repeated F pulses near crops, held F while travelling
+    -- Replant after a harvested crop object actually disappears. Berries/flowers/shinies never replant.
+    -- Assign each crop's SEED item to a numbered hotbar slot, then enter that slot in Farming GUI.
+    -- A 0 means no hotbar slot is assigned, so the script skips planting instead of using the wrong item.
+    FarmingAutoReplant = true,
+    FarmingSeedSlots = { ONIONS = 0, CARROTS = 0, WHEAT = 0, OTHER_CROPS = 0 },
+    FarmingReplantReach = 7,
+    FarmingScanDelay = 1.2,     -- Scan loaded world periodically when looking for the next bush
+    FarmingTargetTimeout = 18, -- Base travel timeout; extended automatically for distant bushes
+    FarmingVisitSeconds = 3.5, -- After reaching a bush, try F briefly then move to a different bush
+    FarmingRevisitDelay = 22,  -- Wait before returning to a previously visited bush
+    FarmingRetryDelay = 9,
+    FarmingThreatRadius = 18,
+    FarmingThreatVerticalRange = 18,
     -- Mining position and safety are separate from Combat's hover settings.
     MiningSearchRange = 500,       -- Ore detection only; Combat SearchRange remains 100
     MiningHoverHeight = 5.5,        -- Root position above top of ore; lower if mining reach is too short
@@ -107,6 +129,30 @@ local CONFIG = {
 
 local enabled = false
 local miningEnabled = false
+local farmingEnabled = false
+local farmingTarget = nil
+local farmingTargetCategory = nil
+local farmingTargetSince = 0
+local farmingLastScan = -math.huge
+local farmingLastClick = -math.huge
+local farmingInteractionBusy = false
+local farmingInteractionGeneration = 0
+CONFIG.FarmingMotion = {
+    fHeld = false,
+    arrived = false,
+    rearmAt = 0,
+    lastMoveCommand = -math.huge,
+    targetDeadline = 0,
+    arrivedAt = 0,
+    speedHumanoid = nil,
+    originalWalkSpeed = nil,
+    harvestPoint = nil,
+    harvestAttempted = false,
+    pendingReplant = nil,
+    replantBusy = false,
+}
+local farmingEvadePosition = nil
+local farmingIgnoreUntil = setmetatable({}, { __mode = "k" })
 local miningClickBusy = false
 local miningClickGeneration = 0
 local lastMiningClick = -math.huge
@@ -135,7 +181,8 @@ local windowFocused = true
 local lastAntiAfk = 0
 local oldCameraType
 local oldCameraSubject
-local restoreCamera -- forward declaration: Mining stop uses this function before its definition
+local restoreCamera -- forward declaration: Farming/Mining stop use this function before its definition
+local setFarmingEnabled -- implemented below the shared movement and mining helpers
 local hoverRoot
 local hoverForce
 local monitoredHumanoid
@@ -489,8 +536,8 @@ local status
 -- ==========================================
 -- Farming / Mining: selection pages
 -- ==========================================
--- These switches persist during this script session. They do not mine or
--- harvest until ABOVE's world objects and normal interactions are mapped.
+-- These switches persist during this script session. Combat and Mining are
+-- unchanged; Farming selections drive the experimental harvesting loop.
 local function createResourcePage(pageName, heading, description, options, selections)
     local page = Instance.new("Frame")
     page.Name = pageName .. "Card"
@@ -533,7 +580,7 @@ local function createResourcePage(pageName, heading, description, options, selec
     note.Name = pageName .. "InfoBadge"
     note.Text = pageName == "MINING"
         and "6 RESOURCES  •  CLICK + OVERHEAD + MOB AVOIDANCE"
-        or "SELECT TARGETS  •  AUTOMATION NOT CONNECTED YET"
+        or "AUTO CYCLE  •  NO SEARCH-RADIUS CAP (LOADED AREAS)"
     note.Font = Enum.Font.GothamBold
     note.TextSize = 10
     note.TextColor3 = Color3.fromRGB(185, 172, 255)
@@ -585,6 +632,40 @@ local function createResourcePage(pageName, heading, description, options, selec
         sub.TextColor3 = Color3.fromRGB(130, 136, 165)
         sub.Parent = line
 
+        -- Each non-berry crop can specify its seed's existing hotbar slot.
+        -- This is an input, not an inventory edit: the script never creates seeds.
+        if pageName == "FARMING" and CONFIG.FarmingSeedSlots[key] ~= nil then
+            label.Size = UDim2.fromOffset(178, 18)
+            sub.Size = UDim2.fromOffset(180, 13)
+            local seedSlot = Instance.new("TextBox")
+            seedSlot.Name = key .. "SeedSlot"
+            seedSlot.Size = UDim2.fromOffset(89, 29)
+            seedSlot.Position = UDim2.fromOffset(200, 8)
+            seedSlot.BackgroundColor3 = Color3.fromRGB(34, 38, 58)
+            seedSlot.BorderSizePixel = 0
+            seedSlot.ClearTextOnFocus = false
+            seedSlot.PlaceholderText = "seed slot #"
+            seedSlot.PlaceholderColor3 = Color3.fromRGB(145, 148, 172)
+            seedSlot.Text = CONFIG.FarmingSeedSlots[key] > 0 and tostring(CONFIG.FarmingSeedSlots[key]) or ""
+            seedSlot.Font = Enum.Font.Gotham
+            seedSlot.TextSize = 11
+            seedSlot.TextColor3 = Color3.fromRGB(242, 242, 249)
+            seedSlot.Parent = line
+            corner(seedSlot, 6)
+            seedSlot.FocusLost:Connect(function()
+                local n = tonumber(seedSlot.Text)
+                if n and n == math.floor(n) and n >= 1 and n <= 9 then
+                    CONFIG.FarmingSeedSlots[key] = n
+                    seedSlot.Text = tostring(n)
+                    if status then status.Text = labelText .. " seed hotbar slot: " .. n end
+                else
+                    CONFIG.FarmingSeedSlots[key] = 0
+                    seedSlot.Text = ""
+                    if status then status.Text = labelText .. ": no seed hotbar slot set" end
+                end
+            end)
+        end
+
         local button, knob = makeSwitch(line, 296, 8, selections[key])
         button.Name = key .. "Toggle"
         button.MouseButton1Click:Connect(function()
@@ -593,13 +674,13 @@ local function createResourcePage(pageName, heading, description, options, selec
             setSwitchVisual(button, knob, selections[key])
             status.Text = pageName == "MINING"
                 and (labelText .. (selections[key] and " selected" or " deselected"))
-                or "Farming selections saved (automation pending)"
+                or (labelText .. (selections[key] and " selected" or " deselected"))
         end)
     end
     return page
 end
 
-local farmingCard = createResourcePage("FARMING", "Auto Harvest", "Choose crops and collectible types.", {
+local farmingCard = createResourcePage("FARMING", "Auto Harvest", "Harvest with F; set seed hotbar slots to replant crops.", {
     {"BERRIES", "Berry Bushes", "Berries and harvestable berry plants"},
     {"ONIONS", "Onions", "Onion crops"},
     {"CARROTS", "Carrots", "Carrot crops"},
@@ -608,6 +689,36 @@ local farmingCard = createResourcePage("FARMING", "Auto Harvest", "Choose crops 
     {"FLOWERS", "Flowers", "World flowers and pickups"},
     {"SHINIES", "Shinies", "Collectible shiny items"},
 }, CONFIG.FarmingTargets)
+
+-- Farming controls: the options list scrolls above a fixed action and focus note.
+local farmingScroll = farmingCard:FindFirstChild("TargetsList")
+farmingScroll.Size = UDim2.new(1, -26, 0, 163)
+
+local farmingFocusNote = Instance.new("TextLabel")
+farmingFocusNote.Name = "FarmingFocusWarning"
+farmingFocusNote.Size = UDim2.new(1, -26, 0, 20)
+farmingFocusNote.Position = UDim2.fromOffset(13, 253)
+farmingFocusNote.BackgroundColor3 = Color3.fromRGB(48, 35, 29)
+farmingFocusNote.BorderSizePixel = 0
+farmingFocusNote.Text = "Replant non-berry crops: set seed slot # (1-9). Keep Roblox focused."
+farmingFocusNote.TextColor3 = Color3.fromRGB(255, 194, 123)
+farmingFocusNote.Font = Enum.Font.GothamBold
+farmingFocusNote.TextSize = 9
+farmingFocusNote.Parent = farmingCard
+corner(farmingFocusNote, 6)
+
+local farmingButton = Instance.new("TextButton")
+farmingButton.Name = "AutoFarmingToggle"
+farmingButton.Size = UDim2.new(1, -26, 0, 33)
+farmingButton.Position = UDim2.fromOffset(13, 281)
+farmingButton.BackgroundColor3 = Color3.fromRGB(87, 63, 157)
+farmingButton.BorderSizePixel = 0
+farmingButton.Text = "START AUTO HARVEST"
+farmingButton.TextColor3 = Color3.fromRGB(246, 244, 253)
+farmingButton.Font = Enum.Font.GothamBold
+farmingButton.TextSize = 11
+farmingButton.Parent = farmingCard
+corner(farmingButton, 8)
 
 local miningCard = createResourcePage("MINING", "Auto Mining", "Select any ores; click from above and avoid mobs.", {
     {"COAL", "Coal", "Coal deposits"},
@@ -748,6 +859,7 @@ updateFocusText()
 
 focusLostConnection = UIS.WindowFocusReleased:Connect(function()
     windowFocused = false
+    if CONFIG.FarmingMotion.setFKey then CONFIG.FarmingMotion.setFKey(false) end
     if alive then updateFocusText() end
 end)
 focusGainedConnection = UIS.WindowFocused:Connect(function()
@@ -1198,6 +1310,7 @@ end
 
 local function setMiningEnabled(value)
     if not alive then return end
+    if value and farmingEnabled and setFarmingEnabled then setFarmingEnabled(false) end
     if value == miningEnabled then return end
     miningEnabled = value
     miningTarget = nil
@@ -1578,11 +1691,593 @@ local function updateMining(root)
 end
 
 -- ==========================================
+-- Farming: selectable crops, flowers and shinies
+-- ==========================================
+-- Experimental: only real workspace objects are considered. Names are
+-- best-effort guesses until verified with P Inspect in ABOVE.
+-- The game server decides whether any interaction grants an item.
+local function compactFarmName(name)
+    return string.lower(tostring(name or "")):gsub("[^%w]", "")
+end
+
+local function farmCategoryOfName(name)
+    local n = compactFarmName(name)
+    -- Never accidentally select seeds, tools, inventory widgets or spawn markers.
+    if n == "" or n:find("seed", 1, true) or n:find("spawn", 1, true)
+        or n:find("inventory", 1, true) or n:find("pickaxe", 1, true) then
+        return nil
+    end
+    if n:find("shiny", 1, true) then return "SHINIES" end
+    if n:find("berrybush", 1, true) or n:find("berryplant", 1, true)
+        or n:find("berries", 1, true) then return "BERRIES" end
+    if n:find("onion", 1, true) then return "ONIONS" end
+    if n:find("carrot", 1, true) then return "CARROTS" end
+    if n:find("wheat", 1, true) then return "WHEAT" end
+    if n:find("flower", 1, true) or n:find("poppy", 1, true)
+        or n:find("tulip", 1, true) or n:find("snapdragon", 1, true)
+        or n:find("daisy", 1, true) or n:find("marigold", 1, true)
+        or n:find("orchid", 1, true) then return "FLOWERS" end
+    if n:find("crop", 1, true) or n:find("pumpkin", 1, true)
+        or n:find("potato", 1, true) or n:find("tomato", 1, true)
+        or n:find("cornplant", 1, true) then return "OTHER_CROPS" end
+    return nil
+end
+
+local function farmCandidate(obj)
+    if not (obj:IsA("Model") or obj:IsA("BasePart")) then return nil end
+    if not obj:IsDescendantOf(workspace) or isPlayerPart(obj) then return nil end
+    local category = farmCategoryOfName(obj.Name)
+    if not category or not CONFIG.FarmingTargets[category] then return nil end
+    -- Prefer the named outer model over its named child parts; scan it once.
+    local ancestor = obj.Parent
+    while ancestor and ancestor ~= workspace do
+        if ancestor:IsA("Model") and farmCategoryOfName(ancestor.Name) == category then
+            return nil
+        end
+        ancestor = ancestor.Parent
+    end
+    local part = getTargetRoot(obj)
+    if not part or not part:IsDescendantOf(workspace) then return nil end
+    return category, part
+end
+
+local function farmTargetHeight(obj, part)
+    local y = part.Position.Y + part.Size.Y / 2
+    if obj:IsA("Model") then
+        local ok, cf, size = pcall(function() return obj:GetBoundingBox() end)
+        if ok and cf and size then
+            y = math.max(y, cf.Position.Y + size.Y / 2)
+        end
+    end
+    return y
+end
+
+-- Determine a GROUND approach point; do not reuse Mining/Combat hover heights.
+-- The visible crop part can be a leaf high above the walkable ground.
+local function farmDesiredPosition(obj, part, category)
+    local center = obj:IsA("Model") and obj:GetPivot().Position or part.Position
+    local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if prompt then
+        local host = prompt.Parent
+        if host and host:IsA("Attachment") then
+            center = host.WorldPosition
+        elseif host and host:IsA("BasePart") then
+            center = host.Position
+        end
+    end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local excluded = {obj}
+    if player.Character then table.insert(excluded, player.Character) end
+    params.FilterDescendantsInstances = excluded
+    local hit = workspace:Raycast(center + Vector3.new(0, 20, 0), Vector3.new(0, -100, 0), params)
+    if hit then
+        return Vector3.new(center.X, hit.Position.Y + 2.5, center.Z)
+    end
+    return center
+end
+
+local function nearFarmingThreat(position)
+    for _, threatPos in ipairs(miningThreats) do
+        local delta = position - threatPos
+        if Vector2.new(delta.X, delta.Z).Magnitude <= CONFIG.FarmingThreatRadius
+            and math.abs(delta.Y) <= CONFIG.FarmingThreatVerticalRange then
+            return true
+        end
+    end
+    return false
+end
+
+local function farmFindNearest(root)
+    local nearest, nearestCategory = nil, nil
+    -- math.huge = search all plants currently replicated in Workspace.
+    -- Roblox streaming may still hide distant plants until the player approaches.
+    local shortest = CONFIG.FarmingSearchRange
+    local now = os.clock()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if (farmingIgnoreUntil[obj] or 0) <= now then
+            local category, part = farmCandidate(obj)
+            if category and part then
+                local distance = (part.Position - root.Position).Magnitude
+                local vertical = math.abs(part.Position.Y - root.Position.Y)
+                if distance < shortest and vertical <= CONFIG.FarmingMaxVerticalDifference then
+                    local desired = farmDesiredPosition(obj, part, category)
+                    if not nearFarmingThreat(desired) then
+                        nearest, nearestCategory = obj, category
+                        shortest = distance
+                    end
+                end
+            end
+        end
+    end
+    return nearest, nearestCategory
+end
+
+local function hasFarmingSelections()
+    for _, selected in pairs(CONFIG.FarmingTargets) do
+        if selected then return true end
+    end
+    return false
+end
+
+-- Only Farming alters WalkSpeed; always return the player's prior setting on stop.
+CONFIG.FarmingMotion.restoreSpeed = function()
+    if CONFIG.FarmingMotion.speedHumanoid and CONFIG.FarmingMotion.speedHumanoid.Parent and CONFIG.FarmingMotion.originalWalkSpeed then
+        pcall(function() CONFIG.FarmingMotion.speedHumanoid.WalkSpeed = CONFIG.FarmingMotion.originalWalkSpeed end)
+    end
+    CONFIG.FarmingMotion.speedHumanoid = nil
+    CONFIG.FarmingMotion.originalWalkSpeed = nil
+end
+
+CONFIG.FarmingMotion.applySpeed = function(humanoid)
+    if CONFIG.FarmingMotion.speedHumanoid ~= humanoid then
+        CONFIG.FarmingMotion.restoreSpeed()
+        CONFIG.FarmingMotion.speedHumanoid = humanoid
+        CONFIG.FarmingMotion.originalWalkSpeed = humanoid.WalkSpeed
+    end
+    if humanoid.WalkSpeed ~= CONFIG.FarmingWalkSpeed then
+        pcall(function() humanoid.WalkSpeed = CONFIG.FarmingWalkSpeed end)
+    end
+end
+
+-- Prefer executor keyboard input when present; fall back to VirtualInputManager.
+-- The same release method is used for stop, target changes, and focus loss.
+CONFIG.FarmingMotion.setFKey = function(shouldHold)
+    shouldHold = shouldHold and farmingEnabled and alive and windowFocused
+        and UIS:GetFocusedTextBox() == nil
+    if CONFIG.FarmingMotion.fHeld == shouldHold then return end
+    local ok, err
+    if type(keypress) == "function" and type(keyrelease) == "function" then
+        ok, err = pcall(function()
+            if shouldHold then keypress(0x46) else keyrelease(0x46) end
+        end)
+    else
+        ok, err = pcall(function()
+            VIM:SendKeyEvent(shouldHold, Enum.KeyCode.F, false, game)
+        end)
+    end
+    if ok then
+        CONFIG.FarmingMotion.fHeld = shouldHold
+    else
+        warn("[ABOVE] Couldn't change F key state: " .. tostring(err))
+    end
+end
+
+local function stopFarmingInteractions()
+    farmingInteractionGeneration = farmingInteractionGeneration + 1
+    CONFIG.FarmingMotion.setFKey(false)
+    CONFIG.FarmingMotion.arrived = false
+    CONFIG.FarmingMotion.rearmAt = 0
+end
+
+setFarmingEnabled = function(value)
+    if not alive then return end
+    if value and miningEnabled then setMiningEnabled(false) end
+    if value and enabled then
+        -- Combat is turned off by the Farming button callback below.
+        -- This is an extra safeguard against both loops running at once.
+        value = false
+    end
+    if farmingEnabled == value then return end
+    farmingEnabled = value
+    farmingTarget = nil
+    farmingTargetCategory = nil
+    farmingTargetSince = 0
+    CONFIG.FarmingMotion.harvestPoint = nil
+    CONFIG.FarmingMotion.harvestAttempted = false
+    CONFIG.FarmingMotion.pendingReplant = nil
+    CONFIG.FarmingMotion.targetDeadline = 0
+    CONFIG.FarmingMotion.arrivedAt = 0
+    farmingLastScan = -math.huge
+    farmingEvadePosition = nil
+    stopFarmingInteractions()
+    if value then
+        -- Farming uses real Humanoid running instead of the Combat/Mining hover.
+        releaseHover()
+        oldCameraType = camera.CameraType
+        oldCameraSubject = camera.CameraSubject
+        farmingButton.Text = "STOP AUTO HARVEST"
+        farmingButton.BackgroundColor3 = Color3.fromRGB(145, 55, 84)
+        status.Text = "Farming: scanning selected plants and collectibles"
+    else
+        farmingButton.Text = "START AUTO HARVEST"
+        farmingButton.BackgroundColor3 = Color3.fromRGB(87, 63, 157)
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if hum and root then pcall(function() hum:MoveTo(root.Position) end) end
+        CONFIG.FarmingMotion.restoreSpeed()
+        releaseHover()
+        restoreCamera()
+        status.Text = "Farming stopped"
+    end
+end
+
+local function farmInteract(expectedTarget, part)
+    if farmingInteractionBusy or not farmingEnabled or not windowFocused then return end
+    local now = os.clock()
+    -- Crops in ABOVE gather with F; retain original pickup handling for flowers/shinies.
+    local isCrop = farmingTargetCategory ~= "FLOWERS" and farmingTargetCategory ~= "SHINIES"
+    local delay = isCrop and CONFIG.FarmingFKeyDelay or CONFIG.FarmingClickDelay
+    if now - farmingLastClick < delay then return end
+    farmingLastClick = now
+    farmingInteractionBusy = true
+    local generation = farmingInteractionGeneration
+    task.spawn(function()
+        local ok, err = pcall(function()
+            if not alive or not farmingEnabled or generation ~= farmingInteractionGeneration
+                or expectedTarget ~= farmingTarget or not windowFocused then return end
+
+            if isCrop then
+                -- A single F press from far away won't trigger the next harvest.
+                -- Keep F held during approach, but repeatedly release and press it
+                -- once CLOSE to the crop so one-keydown-per-harvest games work.
+                CONFIG.FarmingMotion.setFKey(false)
+                task.wait(0.07)
+                if generation ~= farmingInteractionGeneration or expectedTarget ~= farmingTarget
+                    or not windowFocused or not farmingEnabled then return end
+                CONFIG.FarmingMotion.setFKey(true)
+
+                -- If the plant uses Roblox's normal prompt interaction, trigger
+                -- its hold behavior as well. No custom game remotes are called.
+                local prompt = expectedTarget:FindFirstChildWhichIsA("ProximityPrompt", true)
+                if prompt and prompt.Enabled then
+                    local started = false
+                    local okBegin, beginErr = pcall(function()
+                        prompt:InputHoldBegin()
+                        started = true
+                        local untilTime = os.clock() + math.max(0.12, prompt.HoldDuration + 0.08)
+                        while os.clock() < untilTime do
+                            if not alive or not farmingEnabled or generation ~= farmingInteractionGeneration
+                                or expectedTarget ~= farmingTarget or not windowFocused then break end
+                            task.wait(0.04)
+                        end
+                    end)
+                    if started then pcall(function() prompt:InputHoldEnd() end) end
+                    if not okBegin then warn("[ABOVE] Crop prompt error: " .. tostring(beginErr)) end
+                else
+                    task.wait(0.20) -- small physical hold for keyboard-driven collection
+                end
+                CONFIG.FarmingMotion.setFKey(false)
+                return
+            end
+
+            -- Use original proximity/click interactions for flowers and shinies.
+            local prompt = expectedTarget:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if prompt and prompt.Enabled then
+                if type(fireproximityprompt) == "function" then
+                    fireproximityprompt(prompt)
+                    return
+                end
+                prompt:InputHoldBegin()
+                task.wait(math.max(0.08, prompt.HoldDuration + 0.08))
+                pcall(function() prompt:InputHoldEnd() end)
+                return
+            end
+
+            local detector = expectedTarget:FindFirstChildWhichIsA("ClickDetector", true)
+            if detector and type(fireclickdetector) == "function" then
+                fireclickdetector(detector)
+                return
+            end
+            -- For world pickups, hovering close is part of the interaction.
+            -- A click is attempted as fallback if no prompt or detector is exposed.
+            local viewport = camera.ViewportSize
+            local x, y = math.floor(viewport.X / 2), math.floor(viewport.Y / 2)
+            if type(mousemoveabs) == "function" then pcall(mousemoveabs, x, y) end
+            local clicked = false
+            if type(mouse1click) == "function" then clicked = pcall(mouse1click) end
+            if not clicked then virtualClick(x, y) end
+        end)
+        if not ok then warn("[ABOVE] Farming interaction error: " .. tostring(err)) end
+        farmingInteractionBusy = false
+    end)
+end
+
+-- Crop replanting (experimental): only uses the seed hotbar slot configured in the GUI.
+-- It never creates seeds or assumes a successful harvest from a timer alone.
+-- Only call after the old non-berry crop object disappears following an F attempt.
+CONFIG.FarmingMotion.tryReplant = function(job)
+    local slot = CONFIG.FarmingSeedSlots[job.category] or 0
+    if not CONFIG.FarmingAutoReplant or slot < 1 or slot > 9 then
+        return false, "seed slot not set"
+    end
+    if not alive or not farmingEnabled or not windowFocused or UIS:GetFocusedTextBox() then
+        return false, "farming not focused"
+    end
+    local _, root = getCharacter()
+    if not root then return false, "character unavailable" end
+    if (Vector3.new(root.Position.X - job.position.X, 0, root.Position.Z - job.position.Z)).Magnitude
+        > CONFIG.FarmingReplantReach then
+        return false, "too far from harvested plot"
+    end
+    if nearFarmingThreat(job.position) then return false, "unsafe plot" end
+
+    -- Look for exposed tilled/dirt farmland under the former crop. Never click
+    -- unknown ground, player parts, or remaining crops with the seed equipped.
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = player.Character and {player.Character} or {}
+    local hit = workspace:Raycast(job.position + Vector3.new(0, 8, 0), Vector3.new(0, -25, 0), rayParams)
+    if not hit then return false, "no soil detected" end
+    local soilName = string.lower(hit.Instance.Name)
+    if not (soilName:find("soil", 1, true) or soilName:find("farmland", 1, true)
+        or soilName:find("tilled", 1, true) or soilName:find("plot", 1, true)
+        or soilName:find("dirt", 1, true) or soilName:find("grass", 1, true)) then
+        return false, "ground is " .. hit.Instance.Name .. "; not confirmed as plantable"
+    end
+    CONFIG.FarmingMotion.setFKey(false)
+    local generation = farmingInteractionGeneration
+    local keyCodes = {
+        Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three,
+        Enum.KeyCode.Four, Enum.KeyCode.Five, Enum.KeyCode.Six,
+        Enum.KeyCode.Seven, Enum.KeyCode.Eight, Enum.KeyCode.Nine,
+    }
+    local function tapSeedSlot()
+        if type(keypress) == "function" and type(keyrelease) == "function" then
+            keypress(0x30 + slot)
+            task.wait(0.06)
+            keyrelease(0x30 + slot)
+        else
+            VIM:SendKeyEvent(true, keyCodes[slot], false, game)
+            task.wait(0.06)
+            VIM:SendKeyEvent(false, keyCodes[slot], false, game)
+        end
+    end
+    local keyOk, keyErr = pcall(tapSeedSlot)
+    if not keyOk then return false, "seed hotbar key failed: " .. tostring(keyErr) end
+    task.wait(0.12)
+    if generation ~= farmingInteractionGeneration or not farmingEnabled or not windowFocused then
+        return false, "interrupted before planting"
+    end
+
+    -- Aim the camera briefly at the former crop location so mouse input can
+    -- interact with the uncovered soil. Restore it afterward, including on error.
+    local savedType = camera.CameraType
+    local savedCFrame = camera.CFrame
+    local didClick = false
+    local aimOk, aimErr = pcall(function()
+        camera.CameraType = Enum.CameraType.Scriptable
+        camera.CFrame = CFrame.lookAt(root.Position + Vector3.new(0, 5, 0), hit.Position)
+        task.wait(0.10)
+        if generation ~= farmingInteractionGeneration or not farmingEnabled or not windowFocused then return end
+        local view = camera.ViewportSize
+        local x, y = math.floor(view.X / 2), math.floor(view.Y / 2)
+        if type(mousemoveabs) == "function" then pcall(mousemoveabs, x, y) end
+        if type(mouse1click) == "function" then didClick = pcall(mouse1click) end
+        if not didClick then didClick = virtualClick(x, y) end
+    end)
+    pcall(function()
+        camera.CFrame = savedCFrame
+        camera.CameraType = savedType
+    end)
+    if not aimOk then return false, "planting click failed: " .. tostring(aimErr) end
+    return didClick, didClick and "clicked uncovered soil" or "click unavailable"
+end
+
+local function updateFarming(root)
+    local now = os.clock()
+    if not hasFarmingSelections() then
+        setFarmingEnabled(false)
+        status.Text = "Farming stopped: select at least one target"
+        return
+    end
+
+    refreshMiningThreats(now) -- Shared mob recognition, independent of target toggles.
+    -- Finish replanting before running toward another plant.
+    local planting = CONFIG.FarmingMotion.pendingReplant
+    if planting then
+        if now > planting.deadline or not CONFIG.FarmingAutoReplant then
+            CONFIG.FarmingMotion.pendingReplant = nil
+        elseif CONFIG.FarmingMotion.replantBusy then
+            return
+        elseif not windowFocused or UIS:GetFocusedTextBox() then
+            status.Text = "Farming: refocus Roblox to replant"
+            return
+        else
+            CONFIG.FarmingMotion.replantBusy = true
+            task.spawn(function()
+                local ok, result, reason = pcall(CONFIG.FarmingMotion.tryReplant, planting)
+                if CONFIG.FarmingMotion.pendingReplant == planting then
+                    CONFIG.FarmingMotion.pendingReplant = nil
+                end
+                CONFIG.FarmingMotion.replantBusy = false
+                if farmingEnabled and alive then
+                    status.Text = ok and result
+                        and ("Farming: planted attempt (" .. planting.category .. "); check crop")
+                        or ("Farming: replant skipped (" .. tostring(reason or result) .. ")")
+                end
+            end)
+            return
+        end
+    end
+    if farmingTarget then
+        local category, part = farmCandidate(farmingTarget)
+        if not category or category ~= farmingTargetCategory or not part then
+            -- A missing object AFTER an F attempt can indicate harvest completion.
+            -- Never replant berries or pickups, and never plant into an occupied crop.
+            local previousCategory = farmingTargetCategory
+            local previousPlot = CONFIG.FarmingMotion.harvestPoint
+            local previouslyTried = CONFIG.FarmingMotion.harvestAttempted
+            stopFarmingInteractions()
+            if previouslyTried and previousPlot and CONFIG.FarmingSeedSlots[previousCategory] then
+                CONFIG.FarmingMotion.pendingReplant = {
+                    category = previousCategory,
+                    position = previousPlot,
+                    deadline = now + 8,
+                }
+            end
+            CONFIG.FarmingMotion.harvestPoint = nil
+            CONFIG.FarmingMotion.harvestAttempted = false
+            farmingTarget, farmingTargetCategory = nil, nil
+        elseif nearFarmingThreat(farmDesiredPosition(farmingTarget, part, category)) then
+            stopFarmingInteractions()
+            farmingIgnoreUntil[farmingTarget] = now + CONFIG.FarmingRetryDelay
+            farmingTarget, farmingTargetCategory = nil, nil
+        elseif CONFIG.FarmingMotion.arrivedAt > 0
+            and now - CONFIG.FarmingMotion.arrivedAt >= CONFIG.FarmingVisitSeconds then
+            -- Move on even when the same bush stays visible; don't spam one forever.
+            stopFarmingInteractions()
+            farmingIgnoreUntil[farmingTarget] = now + CONFIG.FarmingRevisitDelay
+            farmingTarget, farmingTargetCategory = nil, nil
+            status.Text = "Farming: switching to another plant"
+        elseif now > CONFIG.FarmingMotion.targetDeadline and CONFIG.FarmingMotion.targetDeadline > 0 then
+            -- Skip unreachable plants, even at long distance.
+            stopFarmingInteractions()
+            farmingIgnoreUntil[farmingTarget] = now + CONFIG.FarmingRetryDelay
+            farmingTarget, farmingTargetCategory = nil, nil
+        end
+    end
+
+    if not farmingTarget then
+        CONFIG.FarmingMotion.arrivedAt = 0
+        CONFIG.FarmingMotion.targetDeadline = 0
+    end
+    -- A crop may vanish this exact frame; process its replant job on the next
+    -- Heartbeat BEFORE acquiring another target and moving away from the plot.
+    if CONFIG.FarmingMotion.pendingReplant then return end
+    if not farmingTarget and now - farmingLastScan >= CONFIG.FarmingScanDelay then
+        farmingLastScan = now
+        farmingTarget, farmingTargetCategory = farmFindNearest(root)
+        farmingTargetSince = farmingTarget and now or 0
+        if farmingTarget then
+            CONFIG.FarmingMotion.harvestAttempted = false
+            CONFIG.FarmingMotion.harvestPoint = nil
+            local _, part = farmCandidate(farmingTarget)
+            local travelDistance = part and (part.Position - root.Position).Magnitude or 0
+            local travelSeconds = travelDistance / math.max(CONFIG.FarmingWalkSpeed, 1)
+            CONFIG.FarmingMotion.targetDeadline = now + math.max(CONFIG.FarmingTargetTimeout, travelSeconds * 2.5 + 12)
+        end
+    end
+
+    local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then
+        CONFIG.FarmingMotion.setFKey(false)
+        return
+    end
+    CONFIG.FarmingMotion.applySpeed(humanoid)
+
+    -- Avoid recognized hostile mobs while RUNNING, not just at the destination.
+    if nearFarmingThreat(root.Position) then
+        stopFarmingInteractions()
+        local nearest, nearestDist = nil, math.huge
+        for _, threatPos in ipairs(miningThreats) do
+            local flat = Vector3.new(root.Position.X - threatPos.X, 0, root.Position.Z - threatPos.Z)
+            if flat.Magnitude < nearestDist then
+                nearest, nearestDist = flat, flat.Magnitude
+            end
+        end
+        local escape = nearest and nearest.Magnitude > 0.1 and nearest.Unit
+            or Vector3.new(1, 0, 0)
+        if now - CONFIG.FarmingMotion.lastMoveCommand >= CONFIG.FarmingMoveRefresh then
+            CONFIG.FarmingMotion.lastMoveCommand = now
+            humanoid:MoveTo(root.Position + escape * 25)
+        end
+        status.Text = "Farming: running away from nearby mob"
+        return
+    end
+
+    if not farmingTarget then
+        stopFarmingInteractions()
+        status.Text = "Farming: searching all loaded areas (visited bushes cool down)"
+        return
+    end
+
+    local category, part = farmCandidate(farmingTarget)
+    if not category or not part then
+        stopFarmingInteractions()
+        return
+    end
+    if nearFarmingThreat(farmDesiredPosition(farmingTarget, part, category)) then
+        stopFarmingInteractions()
+        status.Text = "Farming: avoiding dangerous crop location"
+        return
+    end
+
+    if not windowFocused or UIS:GetFocusedTextBox() then
+        CONFIG.FarmingMotion.setFKey(false)
+        humanoid:MoveTo(root.Position)
+        status.Text = "Farming paused: focus ABOVE window"
+        return
+    end
+
+    local desired = farmDesiredPosition(farmingTarget, part, category)
+    local relative = desired - root.Position
+    local horizontal = Vector3.new(relative.X, 0, relative.Z)
+    local distance = horizontal.Magnitude
+    local verticalDistance = math.abs(relative.Y)
+    local prompt = farmingTarget:FindFirstChildWhichIsA("ProximityPrompt", true)
+    local interactRange = CONFIG.FarmingInteractDistance
+    if prompt and prompt.Enabled then
+        interactRange = math.min(interactRange, math.max(1.5, prompt.MaxActivationDistance - 0.5))
+    end
+    local inRange = distance <= interactRange and verticalDistance <= 5
+    local isCrop = category ~= "FLOWERS" and category ~= "SHINIES"
+
+    if not inRange then
+        CONFIG.FarmingMotion.arrived = false
+        -- Hold F while travelling; on arrival briefly release/re-hold to
+        -- trigger interfaces listening for a NEW F key-down within range.
+        CONFIG.FarmingMotion.setFKey(isCrop)
+        if now - CONFIG.FarmingMotion.lastMoveCommand >= CONFIG.FarmingMoveRefresh then
+            CONFIG.FarmingMotion.lastMoveCommand = now
+            local approach = horizontal.Magnitude > 0.1 and horizontal.Unit or Vector3.new(1, 0, 0)
+            -- Aim beside the plant on WALKABLE GROUND, not on top of the bush.
+            local destination = Vector3.new(desired.X, desired.Y, desired.Z) - approach * 2
+            humanoid:MoveTo(destination)
+        end
+        status.Text = "Farming: running (speed " .. CONFIG.FarmingWalkSpeed
+            .. ") toward " .. farmingTarget.Name
+        return
+    end
+
+    if not CONFIG.FarmingMotion.arrived then
+        CONFIG.FarmingMotion.arrived = true
+        if CONFIG.FarmingMotion.arrivedAt == 0 then CONFIG.FarmingMotion.arrivedAt = now end
+        CONFIG.FarmingMotion.rearmAt = now + 0.12
+        CONFIG.FarmingMotion.setFKey(false) -- re-arm key once now that we're inside gather range
+        humanoid:MoveTo(root.Position)
+        status.Text = "Farming: arrived at " .. farmingTarget.Name
+        return
+    end
+    if not isCrop then CONFIG.FarmingMotion.setFKey(false) end
+    if now < CONFIG.FarmingMotion.rearmAt then return end
+    if isCrop and category ~= "BERRIES" then
+        CONFIG.FarmingMotion.harvestPoint = Vector3.new(desired.X, desired.Y - 2.5, desired.Z)
+        CONFIG.FarmingMotion.harvestAttempted = true
+    end
+    farmInteract(farmingTarget, part)
+    status.Text = isCrop and ("Farming: pressing F near " .. farmingTarget.Name)
+        or ("Farming: collecting " .. farmingTarget.Name)
+
+end
+
+-- ==========================================
 -- Anti-idle
 -- ==========================================
 
 idleConnection = player.Idled:Connect(function()
-    if not alive or not (enabled or miningEnabled) or not CONFIG.AntiAFK then return end
+    if not alive or not (enabled or miningEnabled or farmingEnabled) or not CONFIG.AntiAFK then return end
     if os.clock() - lastAntiAfk < 10 then return end
     lastAntiAfk = os.clock()
 
@@ -1623,6 +2318,7 @@ end
 local function setEnabled(value)
     if not alive then return end
     if value and miningEnabled then setMiningEnabled(false) end
+    if value and farmingEnabled then setFarmingEnabled(false) end
     if resetInProgress then
         -- Pressing B / Stop during a respawn cancels automatic resuming.
         if not value then
@@ -1718,6 +2414,22 @@ local function resetCharacter(reason)
     end)
 end
 
+-- Farming start is independent of Combat and Mining.
+farmingButton.MouseButton1Click:Connect(function()
+    if not alive then return end
+    if not farmingEnabled then
+        if not hasFarmingSelections() then
+            status.Text = "Select at least one farming target first"
+            return
+        end
+        if enabled then setEnabled(false) end
+        if miningEnabled then setMiningEnabled(false) end
+        setFarmingEnabled(true)
+    else
+        setFarmingEnabled(false)
+    end
+end)
+
 -- Mining start is independent of Combat's original Auto Combat switch.
 miningButton.MouseButton1Click:Connect(function()
     if not alive then return end
@@ -1741,6 +2453,7 @@ toggle.MouseButton1Click:Connect(function()
 end)
 
 stopButton.MouseButton1Click:Connect(function()
+    setFarmingEnabled(false)
     setMiningEnabled(false)
     setEnabled(false)
     status.Text = "Stopped"
@@ -1771,6 +2484,7 @@ end)
 keyConnection = UIS.InputBegan:Connect(function(input, processed)
     if processed or not alive or UIS:GetFocusedTextBox() then return end
     if input.KeyCode == Enum.KeyCode.B then
+        setFarmingEnabled(false)
         setMiningEnabled(false)
         setEnabled(false)
         status.Text = "Stopped with B"
@@ -1779,6 +2493,7 @@ end)
 
 local function stop()
     if not alive then return end
+    setFarmingEnabled(false)
     setMiningEnabled(false)
     setEnabled(false)
     alive = false
@@ -1803,6 +2518,17 @@ close.MouseButton1Click:Connect(stop)
 
 farmConnection = RunService.Heartbeat:Connect(function()
     if not alive or resetInProgress then return end
+    if farmingEnabled then
+        local _, root = getCharacter()
+        if root then
+            updateFarming(root)
+        else
+            stopFarmingInteractions()
+            releaseHover()
+            status.Text = "Farming: waiting for character"
+        end
+        return
+    end
     if miningEnabled then
         local _, root = getCharacter()
         if root then
