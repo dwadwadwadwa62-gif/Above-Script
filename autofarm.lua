@@ -1,6 +1,7 @@
 --[[
     ABOVE | AUTO MOB FARM V11 - INDIVIDUAL TARGET TOGGLES
     - Slimes exclusive; Skeletons + Morton can be selected together
+    - V27: Fly above Flowers/Shinies, descend and drop onto pickups; preserve crop pathfinding
     - V26: Filter decorative flower pots; route Farming around walls via PathfindingService
     - V25: Boss-only scan range, longer encounter, Shift+P manual Morton lock
     - Three GUI pages: Farming, Combat and Mining
@@ -61,6 +62,10 @@ local CONFIG = {
     FarmingMaxVerticalDifference = math.huge, -- Allow plants at different elevations
     FarmingWalkSpeed = 34,       -- Default Roblox walking is often 16; only while Farming is ON
     FarmingInteractDistance = 3.5, -- Get closer to plants before sending F; must be within game interaction range
+    FarmingPickupFlightHeight = 24, -- Flowers and Shinies only: fly over obstacles before dropping
+    FarmingPickupOverheadRadius = 3, -- How close horizontally to the collectible before descending
+    FarmingPickupDropRelease = 4.5, -- Release hover this high above the pickup and let gravity finish
+    FarmingPickupLandingPause = 0.45, -- Give touch pickups a moment before F/prompt/click attempts
     FarmingMoveRefresh = 0.35,   -- Do not spam Humanoid:MoveTo every Heartbeat
     FarmingWaypointReach = 2.8, -- Progress to next pathfinding waypoint
     FarmingPathStuckSeconds = 2.5,
@@ -173,6 +178,10 @@ CONFIG.FarmingMotion = {
     routeLastProgress = 0,
     routeLastPosition = nil,
     routeRetries = 0,
+    pickupTarget = nil,
+    pickupPhase = nil,
+    pickupCruiseY = nil,
+    pickupReleasedAt = 0,
 }
 local farmingEvadePosition = nil
 local farmingIgnoreUntil = setmetatable({}, { __mode = "k" })
@@ -1974,6 +1983,13 @@ local function stopFarmingInteractions()
     farmingInteractionGeneration = farmingInteractionGeneration + 1
     CONFIG.FarmingMotion.setFKey(false)
     CONFIG.FarmingMotion.clearRoute()
+    if CONFIG.FarmingMotion.pickupPhase then
+        releaseHover() -- Never leave a flower/shiny pickup flight running after changing modes/targets.
+    end
+    CONFIG.FarmingMotion.pickupTarget = nil
+    CONFIG.FarmingMotion.pickupPhase = nil
+    CONFIG.FarmingMotion.pickupCruiseY = nil
+    CONFIG.FarmingMotion.pickupReleasedAt = 0
     CONFIG.FarmingMotion.arrived = false
     CONFIG.FarmingMotion.rearmAt = 0
 end
@@ -2139,9 +2155,9 @@ local function farmInteract(expectedTarget, part)
                 fireclickdetector(detector)
                 return
             end
-            -- Some world flowers use the same context-action F key as crops.
-            -- Try it only after reaching a real (non-decoration) flower.
-            if farmingTargetCategory == "FLOWERS" then
+            -- Try F at close range for BOTH flowers and shinies, after any
+            -- available ProximityPrompt / ClickDetector, before the click fallback.
+            if farmingTargetCategory == "FLOWERS" or farmingTargetCategory == "SHINIES" then
                 CONFIG.FarmingMotion.setFKey(true)
                 task.wait(0.09)
                 CONFIG.FarmingMotion.setFKey(false)
@@ -2157,6 +2173,94 @@ local function farmInteract(expectedTarget, part)
         if not ok then warn("[ABOVE] Farming interaction error: " .. tostring(err)) end
         farmingInteractionBusy = false
     end)
+end
+
+-- Fly-and-drop pickup routine for FLOWERS and SHINIES ONLY.
+-- Crops still use ground running and PathfindingService below, unchanged.
+-- BodyPosition is the existing shared hover mechanic; it is destroyed just
+-- before the player reaches the pickup, allowing a REAL physics landing.
+CONFIG.FarmingMotion.flyToPickup = function(root, humanoid, target, part, desired, now)
+    local motion = CONFIG.FarmingMotion
+    if motion.pickupTarget ~= target then
+        if motion.pickupPhase then releaseHover() end
+        motion.clearRoute()
+        motion.setFKey(false)
+        motion.pickupTarget = target
+        motion.pickupPhase = "ASCEND"
+        motion.pickupCruiseY = nil
+        motion.pickupReleasedAt = 0
+        motion.arrived = false
+    end
+
+    local phase = motion.pickupPhase
+    if phase == "ASCEND" or phase == "FLY" or phase == "DESCEND" then
+        local hold = ensureHover(root)
+        if not hold then return end
+        if not motion.pickupCruiseY then
+            -- ensureHover may lift the character on first activation. Fly well
+            -- above the pickup but avoid progressively increasing altitude.
+            motion.pickupCruiseY = math.max(root.Position.Y, desired.Y) +
+                math.max(4, CONFIG.FarmingPickupFlightHeight - CONFIG.HoverHeight)
+        end
+        if phase == "ASCEND" then
+            hold.Position = Vector3.new(root.Position.X, motion.pickupCruiseY, root.Position.Z)
+            status.Text = "Farming: rising above " .. target.Name
+            if math.abs(root.Position.Y - motion.pickupCruiseY) <= 3 then
+                motion.pickupPhase = "FLY"
+            end
+            return
+        end
+        local horizontal = Vector2.new(root.Position.X - desired.X, root.Position.Z - desired.Z).Magnitude
+        if phase == "FLY" then
+            hold.Position = Vector3.new(desired.X, motion.pickupCruiseY, desired.Z)
+            status.Text = "Farming: flying over " .. target.Name
+            if horizontal <= CONFIG.FarmingPickupOverheadRadius then
+                motion.pickupPhase = "DESCEND"
+            end
+            return
+        end
+        -- Position directly over the collectible and descend without any noclip.
+        hold.Position = Vector3.new(desired.X, desired.Y, desired.Z)
+        status.Text = "Farming: dropping onto " .. target.Name
+        if horizontal <= CONFIG.FarmingPickupOverheadRadius + 1
+            and root.Position.Y - desired.Y <= CONFIG.FarmingPickupDropRelease then
+            releaseHover() -- Gravity / touch collection begins here.
+            motion.pickupPhase = "LAND"
+            motion.pickupReleasedAt = now
+        end
+        return
+    end
+
+    -- Fall naturally and touch the pickup; don't re-enable the hover force.
+    if phase == "LAND" then
+        humanoid:MoveTo(desired)
+        status.Text = "Farming: landing on " .. target.Name
+        if now - motion.pickupReleasedAt < CONFIG.FarmingPickupLandingPause then return end
+        if root.Position.Y - desired.Y > 6 then return end
+        motion.pickupPhase = "COLLECT"
+        motion.arrived = true
+        motion.arrivedAt = now
+    end
+
+    if motion.pickupPhase == "COLLECT" then
+        local horizontal = Vector2.new(root.Position.X - desired.X, root.Position.Z - desired.Z).Magnitude
+        if horizontal > CONFIG.FarmingInteractDistance then
+            if now - motion.lastMoveCommand >= CONFIG.FarmingMoveRefresh then
+                motion.lastMoveCommand = now
+                humanoid:MoveTo(desired)
+            end
+            status.Text = "Farming: closing in on " .. target.Name
+            return
+        end
+        if now - motion.lastMoveCommand >= CONFIG.FarmingMoveRefresh then
+            motion.lastMoveCommand = now
+            humanoid:MoveTo(desired)
+        end
+        -- F, prompts, detectors and fallback clicks are still handled by
+        -- farmInteract; landing on a touch pickup may collect it before this.
+        farmInteract(target, part)
+        status.Text = "Farming: picking up " .. target.Name
+    end
 end
 
 -- Crop replanting (experimental): only uses the seed hotbar slot configured in the GUI.
@@ -2382,12 +2486,21 @@ local function updateFarming(root)
 
     if not windowFocused or UIS:GetFocusedTextBox() then
         CONFIG.FarmingMotion.setFKey(false)
-        humanoid:MoveTo(root.Position)
+        if CONFIG.FarmingMotion.pickupPhase and hoverForce then
+            hoverForce.Position = root.Position -- Hold place; no flight input while tabbed out.
+        else
+            humanoid:MoveTo(root.Position)
+        end
         status.Text = "Farming paused: focus ABOVE window"
         return
     end
 
     local desired = farmDesiredPosition(farmingTarget, part, category)
+    if category == "FLOWERS" or category == "SHINIES" then
+        -- Aerial approach and real drop; crop navigation stays untouched.
+        CONFIG.FarmingMotion.flyToPickup(root, humanoid, farmingTarget, part, desired, now)
+        return
+    end
     local relative = desired - root.Position
     local horizontal = Vector3.new(relative.X, 0, relative.Z)
     local distance = horizontal.Magnitude
