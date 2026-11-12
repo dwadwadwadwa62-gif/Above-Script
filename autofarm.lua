@@ -1,7 +1,7 @@
 --[[
     ABOVE | AUTO MOB FARM V11 - INDIVIDUAL TARGET TOGGLES
     - Slimes exclusive; Skeletons + Morton can be selected together
-    - V27: Fly above Flowers/Shinies, descend and drop onto pickups; preserve crop pathfinding
+    - V28: Flower targeting excludes shinies; Shinies use G; fly-and-drop kept from V27
     - V26: Filter decorative flower pots; route Farming around walls via PathfindingService
     - V25: Boss-only scan range, longer encounter, Shift+P manual Morton lock
     - Three GUI pages: Farming, Combat and Mining
@@ -1825,7 +1825,16 @@ local function farmCandidate(obj)
     if not obj:IsDescendantOf(workspace) or isPlayerPart(obj) then return nil end
     local category = farmCategoryOfName(obj.Name)
     if not category or not CONFIG.FarmingTargets[category] then return nil end
-    if category == "FLOWERS" and CONFIG.FarmingMotion.isDecoration(obj) then return nil end
+    if category == "FLOWERS" then
+        if CONFIG.FarmingMotion.isDecoration(obj) then return nil end
+        -- Never classify a flower-shaped part inside a shiny collectible as a flower.
+        -- Selecting Flowers must not collect Shinies unless Shinies is enabled too.
+        local container = obj.Parent
+        while container and container ~= workspace do
+            if farmCategoryOfName(container.Name) == "SHINIES" then return nil end
+            container = container.Parent
+        end
+    end
     -- Prefer the named outer model over its named child parts; scan it once.
     local ancestor = obj.Parent
     while ancestor and ancestor ~= workspace do
@@ -2137,7 +2146,22 @@ local function farmInteract(expectedTarget, part)
                 return
             end
 
-            -- Use original proximity/click interactions for flowers and shinies.
+            -- Shinies use G, not the flower F input. Keep the fly-and-drop approach,
+            -- but only tap G after we're close enough to attempt collection.
+            if farmingTargetCategory == "SHINIES" then
+                if type(keypress) == "function" and type(keyrelease) == "function" then
+                    keypress(0x47) -- G
+                    task.wait(0.10)
+                    keyrelease(0x47)
+                else
+                    VIM:SendKeyEvent(true, Enum.KeyCode.G, false, game)
+                    task.wait(0.10)
+                    VIM:SendKeyEvent(false, Enum.KeyCode.G, false, game)
+                end
+                return
+            end
+
+            -- Flowers retain their F / proximity / click fallback interactions.
             local prompt = expectedTarget:FindFirstChildWhichIsA("ProximityPrompt", true)
             if prompt and prompt.Enabled then
                 if type(fireproximityprompt) == "function" then
@@ -2155,9 +2179,8 @@ local function farmInteract(expectedTarget, part)
                 fireclickdetector(detector)
                 return
             end
-            -- Try F at close range for BOTH flowers and shinies, after any
-            -- available ProximityPrompt / ClickDetector, before the click fallback.
-            if farmingTargetCategory == "FLOWERS" or farmingTargetCategory == "SHINIES" then
+            -- Try F only for flowers at close range, before the click fallback.
+            if farmingTargetCategory == "FLOWERS" then
                 CONFIG.FarmingMotion.setFKey(true)
                 task.wait(0.09)
                 CONFIG.FarmingMotion.setFKey(false)
@@ -2256,8 +2279,8 @@ CONFIG.FarmingMotion.flyToPickup = function(root, humanoid, target, part, desire
             motion.lastMoveCommand = now
             humanoid:MoveTo(desired)
         end
-        -- F, prompts, detectors and fallback clicks are still handled by
-        -- farmInteract; landing on a touch pickup may collect it before this.
+        -- Flowers use F/prompt/click fallback; Shinies use G. Landing on a
+        -- touch pickup may collect it even before farmInteract runs.
         farmInteract(target, part)
         status.Text = "Farming: picking up " .. target.Name
     end
