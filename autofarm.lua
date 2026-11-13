@@ -89,7 +89,7 @@ local CONFIG = {
     FarmingThreatRadius = 18,
     FarmingThreatVerticalRange = 18,
     -- Mining position and safety are separate from Combat's hover settings.
-    MiningSearchRange = 300,       -- Ore detection only; Combat SearchRange remains 100
+    MiningSearchRange = 500,       -- Ore detection only; Combat SearchRange remains 100
     MiningHoverHeight = 5.5,        -- Root position above top of ore; lower if mining reach is too short
     MiningClickDelay = 0.28,        -- Repeated clicks, NOT a continuous mouse hold
     MiningThreatRadius = 18,       -- Avoid ore deposits with recognized mobs within this horizontal radius
@@ -123,7 +123,7 @@ local CONFIG = {
         STONE = {"Stone", "StoneBlock", "StoneOre", "StoneRock", "StoneNode"},
         CLAY = {"Clay", "ClayBlock", "ClayOre", "ClayDeposit", "ClayNode"},
     },
-    SearchRange = 100,
+    SearchRange = 500,
     MaxVerticalDifference = 50,
     HoverHeight = 12,
     MinHoverHeight = 6,
