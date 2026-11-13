@@ -1474,6 +1474,8 @@ local function classifyPickaxe(name)
     if cleaned:find("wood", 1, true) then return 1, "Wood" end
     if cleaned:find("stone", 1, true) then return 2, "Stone" end
     if cleaned:find("iron", 1, true) then return 3, "Iron+" end
+    -- Goldbone Pickaxe can mine all six ore types, including Gold.
+    if cleaned:find("goldbone", 1, true) then return 3, "Goldbone" end
     for material in pairs(higherPickaxes) do
         if cleaned:find(material, 1, true) then return 3, "Iron+" end
     end
@@ -1546,7 +1548,7 @@ local function refreshMiningPickaxe(now)
         elseif currentMiningPickaxeTier == 2 then
             badge.Text = "PICKAXE: STONE  •  ALL EXCEPT GOLD"
         else
-            badge.Text = "PICKAXE: IRON+  •  ALL 6 RESOURCES AVAILABLE"
+            badge.Text = "PICKAXE: " .. currentMiningPickaxeName .. "  •  ALL 6 RESOURCES AVAILABLE"
         end
     end
 end
