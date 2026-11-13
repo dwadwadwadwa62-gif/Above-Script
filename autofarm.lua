@@ -7,6 +7,8 @@
     - V26: Filter decorative flower pots; route Farming around walls via PathfindingService
     - V25: Boss-only scan range, longer encounter, Shift+P manual Morton lock
     - Three GUI pages: Farming, Combat and Mining
+    - V38: Combat, Morten, and Mining detect targets within 1000 studs (including elevation).
+    - V37: GoldOre model explicitly targets Icosphere.004; P reports ore eligibility and scanner filters
     - V36: Mining pickaxe selector (Wood/Stone/Iron/Goldbone), auto-mines all compatible ores; ignore mobs
     - NOTE: Auto Mining requires the Roblox window to remain focused (does not work tabbed out).
     - Farming: ground-level approach and repeated F pickup attempts; prompt fallback (experimental)
@@ -41,8 +43,8 @@ local CONFIG = {
     },
     SkeletonKeyword = "skeleton",
     BossKeyword = "morten", -- Confirmed actual boss: Workspace.RuinsBoss.Morten (Part).
-    MortonSearchRange = 250, -- Boss-only range. Normal Combat stays at 100 studs.
-    MortonMaxVerticalDifference = 125,
+    MortonSearchRange = 1000, -- Morten boss scan range (studs).
+    MortonMaxVerticalDifference = 1000, -- Do not cut off boss targets at high/low elevations.
     MortonHoverHeight = 5, -- Lower than normal Combat: boss hitboxes may be tall.
     MortonMaxTargetSeconds = 65, -- Allow long boss fights before skipping the target.
     MortonPinnedTarget = nil, -- Set by Shift+P while pointing at Morton; session-only.
@@ -89,7 +91,7 @@ local CONFIG = {
     FarmingThreatRadius = 18,
     FarmingThreatVerticalRange = 18,
     -- Mining position and safety are separate from Combat's hover settings.
-    MiningSearchRange = 3000,       -- Ore detection only; Combat SearchRange remains 100
+    MiningSearchRange = 1000,      -- Find compatible loaded ore deposits up to 1000 studs.
     MiningHoverHeight = 5.5,        -- Root position above top of ore; lower if mining reach is too short
     MiningClickDelay = 0.28,        -- Repeated clicks, NOT a continuous mouse hold
     MiningIgnoreMobs = true,       -- V34: do not skip ore, flee, or stop mining due to enemies
@@ -126,8 +128,8 @@ local CONFIG = {
         STONE = {"Stone", "StoneBlock", "StoneOre", "StoneRock", "StoneNode"},
         CLAY = {"Clay", "ClayBlock", "ClayOre", "ClayDeposit", "ClayNode"},
     },
-    SearchRange = 1000,
-    MaxVerticalDifference = 50,
+    SearchRange = 1000,            -- Slimes and skeletons up to 1000 studs.
+    MaxVerticalDifference = 1000,  -- Remove separate height cutoff for Combat and Mining.
     HoverHeight = 12,
     MinHoverHeight = 6,
     MaxHoverHeight = 24,
@@ -1309,6 +1311,16 @@ inspectConnection = UIS.InputBegan:Connect(function(input, processed)
         return
     end
     status.Text = "Inspect: " .. hit.Name .. (model and " / " .. model.Name or "")
+    -- Mining inspect is installed below after the ore classifier is defined.
+    -- Pressing P on an ore now reports its ore type, usable mesh, pickaxe
+    -- requirements and distance limits, without changing the mining target.
+    if CONFIG.MiningInspect then
+        local miningDetails = CONFIG.MiningInspect(hit)
+        if miningDetails then
+            status.Text = miningDetails
+            return
+        end
+    end
     if namedBoss then
         print("[ABOVE] Named Morton detected. Enable MORTON, then press P again to lock.")
     elseif forced then
@@ -1508,8 +1520,11 @@ local function getOrePart(model)
     -- Some ore nodes are single Parts rather than Models (including possible Gold).
     if model:IsA("BasePart") then return model end
     if not model:IsA("Model") then return nil end
-    -- Keep the exact working IronOre mesh selection for iron.
-    if oreTypeOf(model) == "IRON" or oreTypeOf(model) == "GOLD" then
+    -- The player's P inspector identified GoldOre as a Model with a
+    -- clickable Icosphere.004 child. Aim the miner at that exact mesh;
+    -- preserve the same previously working mesh preference for IronOre.
+    local oreKind = oreTypeOf(model)
+    if oreKind == "IRON" or oreKind == "GOLD" then
         local inspectedPart = model:FindFirstChild("Icosphere.004", true)
         if inspectedPart and inspectedPart:IsA("BasePart") then
             return inspectedPart
@@ -1521,6 +1536,8 @@ end
 local function oreTopPosition(model, part)
     -- Use the actual upper surface of the whole ore model where possible.
     local top = part.Position.Y + part.Size.Y * 0.5
+    -- For GoldOre, use the confirmed mining mesh rather than the model's
+    -- entire bounding box, which may include non-minable decorations.
     if model:IsA("Model") and oreTypeOf(model) ~= "GOLD" then
         local ok, cf, size = pcall(function() return model:GetBoundingBox() end)
         if ok and cf and size then
@@ -1528,6 +1545,49 @@ local function oreTopPosition(model, part)
         end
     end
     return Vector3.new(part.Position.X, top, part.Position.Z)
+end
+
+-- V37: P inspect follows the clicked mesh to its ore Model, then prints
+-- a concrete reason if the automatic miner would skip that ore.
+CONFIG.MiningInspect = function(hit)
+    local ore = hit
+    while ore and ore ~= workspace do
+        if oreTypeOf(ore) then break end
+        ore = ore.Parent
+    end
+    if not ore or ore == workspace then return nil end
+    local oreType = oreTypeOf(ore)
+    local part = getOrePart(ore)
+    local rank = CONFIG.MiningPickaxeTiers[CONFIG.MiningPickaxe] or 1
+    local required = CONFIG.MiningRequiredPickaxe[oreType] or 99
+    local _, root = getCharacter()
+    local distance = root and part and (part.Position - root.Position).Magnitude or nil
+    local vertical = root and part and math.abs(part.Position.Y - root.Position.Y) or nil
+    local reason
+    if not part then
+        reason = "NO MINEABLE PART"
+    elseif rank < required then
+        reason = "PICKAXE TOO LOW (select Iron/Goldbone for Gold)"
+    elseif not root then
+        reason = "NO CHARACTER ROOT"
+    elseif distance >= CONFIG.MiningSearchRange then
+        reason = "OUTSIDE MINING SEARCH RANGE"
+    elseif vertical > CONFIG.MaxVerticalDifference then
+        reason = "HEIGHT DIFFERENCE TOO LARGE"
+    elseif (miningIgnoreUntil[ore] or 0) > os.clock() then
+        reason = "TEMPORARY RETRY COOLDOWN"
+    else
+        reason = "ELIGIBLE: scanner should recognize this rock"
+    end
+    local report = string.format(
+        "ORE INSPECT: %s | model=%s | mesh=%s | pickaxe=%s (tier %d/%d) | distance=%s | vertical=%s | %s",
+        tostring(oreType), ore:GetFullName(), part and part.Name or "missing",
+        CONFIG.MiningPickaxe, rank, required,
+        distance and tostring(math.floor(distance)) or "unknown",
+        vertical and tostring(math.floor(vertical)) or "unknown", reason
+    )
+    print("[ABOVE MINING] " .. report)
+    return "Mining: " .. oreType .. " / " .. tostring(part and part.Name or "NO PART") .. " - " .. reason
 end
 
 local function refreshMiningThreats(now)
@@ -3011,4 +3071,4 @@ farmConnection = RunService.Heartbeat:Connect(function()
     end
 end)
 
-print("[ABOVE] V36: Select Wood/Stone/Iron/Goldbone in Mining; auto-mines all compatible rocks. Mining ignores mobs. Combat/Farming preserved.")
+print("[ABOVE] V37: GoldOre Icosphere.004 targeting; P inspects ore eligibility. All V36 features preserved.")
