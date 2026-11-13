@@ -7,7 +7,7 @@
     - V26: Filter decorative flower pots; route Farming around walls via PathfindingService
     - V25: Boss-only scan range, longer encounter, Shift+P manual Morton lock
     - Three GUI pages: Farming, Combat and Mining
-    - Mining: six selectable resources with Wood/Stone/Iron+ pickaxe tier checks, overhead clicks, mob avoidance
+    - Mining: six selectable resources with Wood/Stone/Iron+ pickaxe tier checks, overhead clicks; ignore mobs
     - NOTE: Auto Mining requires the Roblox window to remain focused (does not work tabbed out).
     - Farming: ground-level approach and repeated F pickup attempts; prompt fallback (experimental)
     - Cleaner GUI inspired by user reference
@@ -89,9 +89,10 @@ local CONFIG = {
     FarmingThreatRadius = 18,
     FarmingThreatVerticalRange = 18,
     -- Mining position and safety are separate from Combat's hover settings.
-    MiningSearchRange = 1000,       -- Ore detection only; Combat SearchRange remains 100
+    MiningSearchRange = 300,       -- Ore detection only; Combat SearchRange remains 100
     MiningHoverHeight = 5.5,        -- Root position above top of ore; lower if mining reach is too short
     MiningClickDelay = 0.28,        -- Repeated clicks, NOT a continuous mouse hold
+    MiningIgnoreMobs = true,       -- V34: do not skip ore, flee, or stop mining due to enemies
     MiningThreatRadius = 18,       -- Avoid ore deposits with recognized mobs within this horizontal radius
     MiningThreatVerticalRange = 18,
     MiningThreatScanDelay = 0.75,  -- Cache hostile positions; don't scan workspace each Heartbeat
@@ -123,7 +124,7 @@ local CONFIG = {
         STONE = {"Stone", "StoneBlock", "StoneOre", "StoneRock", "StoneNode"},
         CLAY = {"Clay", "ClayBlock", "ClayOre", "ClayDeposit", "ClayNode"},
     },
-    SearchRange = 1000,
+    SearchRange = 100,
     MaxVerticalDifference = 50,
     HoverHeight = 12,
     MinHoverHeight = 6,
@@ -754,7 +755,7 @@ farmingButton.TextSize = 11
 farmingButton.Parent = farmingCard
 corner(farmingButton, 8)
 
-local miningCard = createResourcePage("MINING", "Auto Mining", "Select any ores; click from above and avoid mobs.", {
+local miningCard = createResourcePage("MINING", "Auto Mining", "Select ores; mine from above. Mob avoidance OFF.", {
     {"COAL", "Coal", "Coal deposits"},
     {"IRON", "Iron", "Iron ore deposits"},
     {"GOLD", "Gold", "Gold ore deposits"},
@@ -1325,27 +1326,48 @@ end
 local function attack()
     if not alive or not enabled then return end
 
+    -- COMBAT ONLY: VIM uses coordinates relative to the Roblox viewport.
+    -- mousemoveabs() instead uses desktop coordinates, so moving the Roblox
+    -- window to another monitor can send clicks to the wrong screen.
     local view = camera.ViewportSize
     local x = math.floor(view.X / 2)
     local y = math.floor(view.Y / 2)
 
+    -- Aim at the target's actual screen position rather than assuming that
+    -- the enemy is always perfectly centered.  The camera still follows
+    -- the target exactly as before.
+    if currentTarget and currentTarget:IsDescendantOf(workspace) then
+        local targetPart = getTargetRoot(currentTarget)
+        if targetPart then
+            local screenPos, visible = camera:WorldToViewportPoint(targetPart.Position)
+            if visible and screenPos.Z > 0 then
+                x = math.clamp(math.floor(screenPos.X + 0.5), 0, math.max(0, view.X - 1))
+                y = math.clamp(math.floor(screenPos.Y + 0.5), 0, math.max(0, view.Y - 1))
+            end
+        end
+    end
+
+    -- V33 MULTI-CLIENT FIX: attempt both Roblox-window-relative virtual clicks
+    -- and Tool:Activate while this client is unfocused. The old V32 branch
+    -- called only Tool:Activate, which may not trigger click-driven weapons.
+    -- Neither method is guaranteed to work if Roblox blocks background input.
     if not windowFocused then
         if not CONFIG.BackgroundAttack then return end
-        if activateTool() then return end
         virtualClick(x, y)
+        activateTool()
         return
     end
 
-    if type(mousemoveabs) == "function" then pcall(mousemoveabs, x, y) end
+    -- Use window-relative virtual input FIRST. Never move the OS cursor to
+    -- un-offset (x,y) desktop coordinates, which breaks secondary monitors.
+    if virtualClick(x, y) then return end
 
-    local clicked = false
-    if type(mouse1click) == "function" then clicked = pcall(mouse1click) end
-    if not clicked then clicked = virtualClick(x, y) end
-    if not clicked then activateTool() end
+    -- Fallback does not need to move the physical pointer.
+    activateTool()
 end
 
 -- ==========================================
--- Mining: individually selectable ores, clicking overhead with mob avoidance
+-- Mining: individually selectable ores, clicking overhead; optional mob avoidance (OFF by default)
 -- ==========================================
 -- IronOre was observed in workspace; aliases for other resource types are
 -- provisional and must be checked against ABOVE's real Model names.
@@ -1617,7 +1639,7 @@ local function findNearestSafeOre(root)
                     local distance = (orePart.Position - root.Position).Magnitude
                     local vertical = math.abs(orePart.Position.Y - root.Position.Y)
                     if distance < bestDistance and vertical <= CONFIG.MaxVerticalDifference
-                        and not nearMiningThreat(minePos) then
+                        and (CONFIG.MiningIgnoreMobs or not nearMiningThreat(minePos)) then
                         candidate = obj
                         bestDistance = distance
                     end
@@ -1661,7 +1683,7 @@ local function updateMining(root)
         return
     end
 
-    refreshMiningThreats(now)
+    if not CONFIG.MiningIgnoreMobs then refreshMiningThreats(now) end
     local targetOreType = miningTarget and oreTypeOf(miningTarget)
     local part = miningTarget and miningTarget:IsDescendantOf(workspace)
         and targetOreType and CONFIG.MiningTargets[targetOreType]
@@ -1671,7 +1693,7 @@ local function updateMining(root)
         if miningTarget then stopMiningClicks() end
         miningTarget = nil
         miningTargetSince = 0
-    elseif nearMiningThreat(oreTopPosition(miningTarget, part)
+    elseif not CONFIG.MiningIgnoreMobs and nearMiningThreat(oreTopPosition(miningTarget, part)
         + Vector3.new(0, CONFIG.MiningHoverHeight, 0)) then
         -- Never mine through a nearby hostile mob: skip and seek a safer node.
         stopMiningClicks()
@@ -1694,11 +1716,11 @@ local function updateMining(root)
 
     if not miningTarget then
         stopMiningClicks()
-        if nearMiningThreat(root.Position) then
+        if not CONFIG.MiningIgnoreMobs and nearMiningThreat(root.Position) then
             evadeMiningMobs(root)
         else
             miningEvadePosition = nil
-            status.Text = "Mining: no safe selected ores within " .. CONFIG.MiningSearchRange .. " studs"
+            status.Text = "Mining: no selected ores within " .. CONFIG.MiningSearchRange .. " studs"
         end
         return
     end
@@ -1739,7 +1761,7 @@ local function updateMining(root)
     local oreTop = oreTopPosition(miningTarget, orePart)
     local desired = oreTop + Vector3.new(0, CONFIG.MiningHoverHeight, 0)
 
-    if nearMiningThreat(desired) then
+    if not CONFIG.MiningIgnoreMobs and nearMiningThreat(desired) then
         evadeMiningMobs(root)
         return
     end
@@ -3080,4 +3102,4 @@ farmConnection = RunService.Heartbeat:Connect(function()
     end
 end)
 
-print("[ABOVE] V31: Morten boss Part targeting fixed. Enable Morton and press P while aiming at Morten if needed. Farming/Mining unchanged.")
+print("[ABOVE] V34: Mining ignores mobs (no threat-based skip or evasion). Combat/Farming unchanged; background attack preserved.")
