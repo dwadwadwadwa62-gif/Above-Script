@@ -1509,7 +1509,7 @@ local function getOrePart(model)
     if model:IsA("BasePart") then return model end
     if not model:IsA("Model") then return nil end
     -- Keep the exact working IronOre mesh selection for iron.
-    if oreTypeOf(model) == "IRON" then
+    if oreTypeOf(model) == "IRON" or oreTypeOf(model) == "GOLD" then
         local inspectedPart = model:FindFirstChild("Icosphere.004", true)
         if inspectedPart and inspectedPart:IsA("BasePart") then
             return inspectedPart
@@ -1521,7 +1521,7 @@ end
 local function oreTopPosition(model, part)
     -- Use the actual upper surface of the whole ore model where possible.
     local top = part.Position.Y + part.Size.Y * 0.5
-    if model:IsA("Model") then
+    if model:IsA("Model") and oreTypeOf(model) ~= "GOLD" then
         local ok, cf, size = pcall(function() return model:GetBoundingBox() end)
         if ok and cf and size then
             top = math.max(top, cf.Position.Y + size.Y * 0.5)
