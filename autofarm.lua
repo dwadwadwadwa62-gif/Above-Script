@@ -1,6 +1,7 @@
 --[[
     ABOVE | AUTO MOB FARM V11 - INDIVIDUAL TARGET TOGGLES
     - Slimes exclusive; Skeletons + Morton can be selected together
+    - V31: Actual boss is Workspace.RuinsBoss.Morten (Part) -- supports Morten and Morton names.
     - V29: Morton-named stationary targets are detectable; P on Morton locks boss, Shift+P manual override
     - V28: Flower targeting excludes shinies; Shinies use G; fly-and-drop kept from V27
     - V26: Filter decorative flower pots; route Farming around walls via PathfindingService
@@ -39,7 +40,7 @@ local CONFIG = {
         orangeslime = true,
     },
     SkeletonKeyword = "skeleton",
-    BossKeyword = "morton", -- Name-based detection; P locks Morton, Shift+P forces a manual lock.
+    BossKeyword = "morten", -- Confirmed actual boss: Workspace.RuinsBoss.Morten (Part).
     MortonSearchRange = 250, -- Boss-only range. Normal Combat stays at 100 studs.
     MortonMaxVerticalDifference = 125,
     MortonHoverHeight = 5, -- Lower than normal Combat: boss hitboxes may be tall.
@@ -88,7 +89,7 @@ local CONFIG = {
     FarmingThreatRadius = 18,
     FarmingThreatVerticalRange = 18,
     -- Mining position and safety are separate from Combat's hover settings.
-    MiningSearchRange = 500,       -- Ore detection only; Combat SearchRange remains 100
+    MiningSearchRange = 300,       -- Ore detection only; Combat SearchRange remains 100
     MiningHoverHeight = 5.5,        -- Root position above top of ore; lower if mining reach is too short
     MiningClickDelay = 0.28,        -- Repeated clicks, NOT a continuous mouse hold
     MiningThreatRadius = 18,       -- Avoid ore deposits with recognized mobs within this horizontal radius
@@ -122,7 +123,7 @@ local CONFIG = {
         STONE = {"Stone", "StoneBlock", "StoneOre", "StoneRock", "StoneNode"},
         CLAY = {"Clay", "ClayBlock", "ClayOre", "ClayDeposit", "ClayNode"},
     },
-    SearchRange = 500,
+    SearchRange = 100,
     MaxVerticalDifference = 50,
     HoverHeight = 12,
     MinHoverHeight = 6,
@@ -1022,7 +1023,7 @@ searchBox.FocusLost:Connect(function()
         setTargetEnabled("SLIMES", true)
     elseif term == "skeleton" or term == "skeletons" then
         setTargetEnabled("SKELETONS", true)
-    elseif term == "morton" or term == "boss" then
+    elseif term == "morton" or term == "morten" or term == "boss" then
         setTargetEnabled("MORTON", true)
     elseif term == "both" or term == "skeletons+morton" then
         setTargetEnabled("SKELETONS", true)
@@ -1072,7 +1073,10 @@ end
 -- The boss may be a Model or a directly named Part like ABOVE's slimes.
 -- Prefer a named boss Model over one of its child parts; never target a map container.
 local function isMortonName(name)
-    return string.find(string.lower(name), CONFIG.BossKeyword, 1, true) ~= nil
+    local lowered = string.lower(name)
+    -- ABOVE's boss is spelled Morten; keep the old Morton spelling as an alias.
+    return string.find(lowered, CONFIG.BossKeyword, 1, true) ~= nil
+        or string.find(lowered, "morton", 1, true) ~= nil
 end
 
 local function getTargetKind(target)
@@ -3076,4 +3080,4 @@ farmConnection = RunService.Heartbeat:Connect(function()
     end
 end)
 
-print("[ABOVE] V29 ready: Morton stationary-target filter fixed; press P while pointing at Morton to lock. Farming/Mining unchanged.")
+print("[ABOVE] V31: Morten boss Part targeting fixed. Enable Morton and press P while aiming at Morten if needed. Farming/Mining unchanged.")
